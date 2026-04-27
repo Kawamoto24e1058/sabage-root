@@ -4,7 +4,7 @@
 	import { db, auth } from '$lib/firebase';
 	import { signInAnonymously } from 'firebase/auth';
 	import { doc, setDoc, updateDoc, serverTimestamp, getDoc, collection, addDoc } from 'firebase/firestore';
-	import type { RoutePoint, Field, SpawnPoint } from 'shared-types';
+	import type { RoutePoint, Field, SpawnPoint, GameMode, TeamConfig } from 'shared-types';
 
 	const matchId = page.params.matchId;
 
@@ -17,12 +17,23 @@
 		{ label: 'オレンジ', value: '#f97316' },
 	];
 
-	type Screen = 'setup' | 'spawn' | 'tracking' | 'done';
+	type Screen = 'setup' | 'spawn' | 'tracking' | 'respawn' | 'done';
 	let screen = $state<Screen>('setup');
+
+	// Match settings (fetched from Firestore)
+	let gameMode = $state<GameMode>('elimination');
+	let matchTeams = $state<TeamConfig[]>([
+		{ id: 'A', name: 'チームA' },
+		{ id: 'B', name: 'チームB' },
+	]);
+	let respawnCooldownSec = $state(30);
+	let respawnCountdown = $state(0);
+	let respawnTimer: ReturnType<typeof setInterval> | null = null;
+	let deathCount = $state(0);
 
 	// Setup
 	let playerName = $state('');
-	let selectedTeam = $state<'A' | 'B'>('A');
+	let selectedTeam = $state('A');
 	let selectedColor = $state(TEAM_COLORS[0].value);
 
 	// Spawn selection
@@ -120,22 +131,18 @@
 		cleanup();
 	});
 
-	function cleanup() {
-		if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
-		if (spawnWatchId !== null) { navigator.geolocation.clearWatch(spawnWatchId); spawnWatchId = null; }
-		if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
-		if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-		if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; wakeLockActive = false; }
-	}
-
 	// セットアップ完了 → スポーン選択 or 直接トラッキング
 	async function handleSetupNext() {
 		if (!uid) return;
-		// フィールド取得
+		// マッチ＋フィールド取得
 		try {
 			const matchDoc = await getDoc(doc(db, 'matches', matchId));
 			if (matchDoc.exists()) {
 				const matchData = matchDoc.data();
+				// ゲームモード・チーム設定を反映
+				if (matchData.gameMode) gameMode = matchData.gameMode;
+				if (matchData.teams && matchData.teams.length > 0) matchTeams = matchData.teams;
+				if (matchData.respawnCooldownSec) respawnCooldownSec = matchData.respawnCooldownSec;
 				if (matchData.fieldId) {
 					const fieldDoc = await getDoc(doc(db, 'fields', matchData.fieldId));
 					if (fieldDoc.exists()) {
@@ -328,10 +335,65 @@
 		screen = 'done';
 	}
 
-	function handleHit() {
-		isHit = true;
+	function cleanup() {
+		if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+		if (spawnWatchId !== null) { navigator.geolocation.clearWatch(spawnWatchId); spawnWatchId = null; }
+		if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
+		if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+		if (respawnTimer) { clearInterval(respawnTimer); respawnTimer = null; }
+		if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; wakeLockActive = false; }
+	}
+
+	async function handleHit() {
 		const last = routeRef[routeRef.length - 1];
-		finishTracking(last ? { lat: last.lat, lng: last.lng } : undefined);
+		const hitPos = last ? { lat: last.lat, lng: last.lng } : undefined;
+
+		if (gameMode === 'elimination') {
+			// 殲滅戦: そのまま終了
+			isHit = true;
+			finishTracking(hitPos);
+		} else {
+			// 復活あり: ヒットを記録しつつ tracking 継続 or 待機
+			deathCount++;
+			if (hitPos && uid) {
+				const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+				try {
+					const { arrayUnion } = await import('firebase/firestore');
+					await updateDoc(logRef, {
+						hitEvent: { ...hitPos, timestamp: Date.now() },
+						hitEvents: arrayUnion({ ...hitPos, timestamp: Date.now() }),
+					});
+				} catch(e) { console.warn(e); }
+			}
+
+			if (gameMode === 'unlimited_respawn') {
+				screen = 'respawn';
+			} else {
+				// timed_respawn: カウントダウン
+				respawnCountdown = respawnCooldownSec;
+				screen = 'respawn';
+				respawnTimer = setInterval(() => {
+					respawnCountdown--;
+					if (respawnCountdown <= 0) {
+						clearInterval(respawnTimer!);
+						respawnTimer = null;
+						handleRespawn();
+					}
+				}, 1000);
+			}
+		}
+	}
+
+	async function handleRespawn() {
+		if (respawnTimer) { clearInterval(respawnTimer); respawnTimer = null; }
+		// 復活: hitEvent をクリアして追跡再開
+		if (uid) {
+			const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+			try {
+				await updateDoc(logRef, { hitEvent: null });
+			} catch(e) { console.warn(e); }
+		}
+		screen = 'tracking';
 	}
 
 	function handleStop() {
@@ -376,11 +438,11 @@
 	<div class="form-group">
 		<label class="form-label">チーム</label>
 		<div class="team-row">
-			{#each (['A', 'B'] as const) as t}
+			{#each matchTeams as t}
 				<button
-					class="team-btn {selectedTeam === t ? 'team-btn-active' : ''}"
-					onclick={() => selectedTeam = t}
-				>チーム {t}</button>
+					class="team-btn {selectedTeam === t.id ? 'team-btn-active' : ''}"
+					onclick={() => selectedTeam = t.id}
+				>{t.name}</button>
 			{/each}
 		</div>
 	</div>
@@ -567,6 +629,31 @@
 </div>
 
 <!-- ══════════════════════════════════════════ -->
+<!-- Respawn Screen                            -->
+<!-- ══════════════════════════════════════════ -->
+{:else if screen === 'respawn'}
+<div class="screen respawn-screen">
+	<div class="respawn-icon">💀</div>
+	<div class="respawn-title">ヒット！</div>
+	<div class="respawn-deaths">{deathCount}回目</div>
+
+	{#if gameMode === 'timed_respawn'}
+		<div class="respawn-countdown">
+			<div class="respawn-sec">{respawnCountdown}</div>
+			<div class="respawn-sec-label">秒後に復活</div>
+		</div>
+	{:else}
+		<button class="respawn-btn" onclick={handleRespawn}>
+			🔄 復活する
+		</button>
+	{/if}
+
+	<button class="stop-btn" style="margin-top:auto;" onclick={handleStop}>
+		試合終了・データ送信
+	</button>
+</div>
+
+<!-- ══════════════════════════════════════════ -->
 <!-- Done Screen                               -->
 <!-- ══════════════════════════════════════════ -->
 {:else}
@@ -710,6 +797,36 @@
 		color: #4b5563;
 		line-height: 1.5;
 		margin: 0;
+	}
+
+	/* ── Respawn ── */
+	.respawn-screen {
+		align-items: center;
+		justify-content: center;
+		gap: 16px;
+		background: rgba(239,68,68,0.05);
+	}
+	.respawn-icon { font-size: 4rem; }
+	.respawn-title { font-size: 2rem; font-weight: 900; color: #ef4444; }
+	.respawn-deaths { font-size: 0.85rem; color: #6b7280; }
+	.respawn-countdown { text-align: center; }
+	.respawn-sec {
+		font-size: 5rem;
+		font-weight: 900;
+		font-variant-numeric: tabular-nums;
+		color: #f87171;
+		line-height: 1;
+	}
+	.respawn-sec-label { font-size: 0.9rem; color: #9ca3af; margin-top: 4px; }
+	.respawn-btn {
+		padding: 18px 40px;
+		background: #4ade80;
+		color: #000;
+		border: none;
+		border-radius: 16px;
+		font-size: 1.1rem;
+		font-weight: 800;
+		cursor: pointer;
 	}
 
 	/* ── Spawn ── */

@@ -3,8 +3,7 @@
 	import { page } from '$app/state';
 	import { db } from '$lib/firebase';
 	import { collection, onSnapshot, doc, getDoc, getDocs, updateDoc } from 'firebase/firestore';
-	import type { PlayerLog, Field, Match, MatchStatus, SpawnPoint, VirtualPoint, ObstacleLine } from 'shared-types';
-	import type { HitEvent } from 'shared-types';
+	import type { PlayerLog, Field, Match, MatchStatus, SpawnPoint, VirtualPoint, ObstacleLine, GameMode, TeamConfig } from 'shared-types';
 	import { Play, Pause, RotateCcw, FastForward, ArrowLeft, Circle, QrCode, BarChart2, Flame } from 'lucide-svelte';
 
 	// Leaflet types
@@ -554,6 +553,50 @@
 		finished: ''
 	};
 
+	// ─── 試合設定 ────────────────────────────────────────────────────────
+	const GAME_MODE_LABELS: Record<GameMode, string> = {
+		elimination:       '殲滅戦（死んだら終わり）',
+		unlimited_respawn: '無制限復活',
+		timed_respawn:     '制限時間復活',
+	};
+
+	const DEFAULT_TEAM_NAMES = ['チームA','チームB','チームC','チームD'];
+
+	let settingMode = $state<GameMode>('elimination');
+	let settingTeamCount = $state(2);
+	let settingTeamNames = $state<string[]>(['チームA','チームB','チームC','チームD']);
+	let settingRespawnSec = $state(30);
+	let savingSettings = $state(false);
+
+	// matchが読み込まれたら設定を反映
+	$effect(() => {
+		if (!match) return;
+		if (match.gameMode) settingMode = match.gameMode;
+		if (match.teams) {
+			settingTeamCount = match.teams.length;
+			settingTeamNames = [
+				...match.teams.map(t => t.name),
+				...DEFAULT_TEAM_NAMES.slice(match.teams.length)
+			];
+		}
+		if (match.respawnCooldownSec) settingRespawnSec = match.respawnCooldownSec;
+	});
+
+	async function saveMatchSettings() {
+		savingSettings = true;
+		const teams: TeamConfig[] = ['A','B','C','D']
+			.slice(0, settingTeamCount)
+			.map((id, i) => ({ id, name: settingTeamNames[i] || `チーム${id}` }));
+		try {
+			await updateDoc(doc(db, 'matches', matchId), {
+				gameMode: settingMode,
+				teams,
+				respawnCooldownSec: settingRespawnSec,
+			});
+		} catch (e) { console.error(e); }
+		savingSettings = false;
+	}
+
 	async function advanceStatus() {
 		if (!match) return;
 		const next = STATUS_NEXT[match.status];
@@ -635,7 +678,7 @@
 		{/if}
 	</div>
 
-	<!-- 待機中：参加者募集パネル -->
+	<!-- 待機中：参加者募集 + 試合設定パネル -->
 	{#if match?.status === 'waiting' && !joinPanelDismissed}
 		<div class="join-panel">
 			<div class="join-panel-header">
@@ -644,11 +687,13 @@
 			</div>
 			<p class="join-panel-sub">スマホのカメラでQRをスキャン</p>
 			<img
-				src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=e5e5e5&bgcolor=0a0a0a&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
+				src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&color=e5e5e5&bgcolor=0a0a0a&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
 				alt="QR Code"
 				class="join-qr"
 			/>
 			<div class="join-url">/track/{matchId.slice(0,12)}…</div>
+
+			<!-- 参加者リスト -->
 			<div class="join-players">
 				{#if logs.length === 0}
 					<span class="join-players-none">まだ誰も参加していません</span>
@@ -659,12 +704,64 @@
 							<div class="join-player-item">
 								<span class="join-player-dot" style="background:{p.teamColor}"></span>
 								<span>{p.name || p.id}</span>
-								<span class="join-player-team">チーム{p.team ?? '?'}</span>
+								<span class="join-player-team">{p.team ?? '?'}</span>
 							</div>
 						{/each}
 					</div>
 				{/if}
 			</div>
+
+			<!-- 試合設定 -->
+			<div class="settings-section">
+				<div class="settings-title">⚙ 試合設定</div>
+
+				<div class="settings-row">
+					<span class="settings-label">ゲームモード</span>
+					<select class="settings-select" bind:value={settingMode}>
+						<option value="elimination">殲滅戦</option>
+						<option value="unlimited_respawn">無制限復活</option>
+						<option value="timed_respawn">制限時間復活</option>
+					</select>
+				</div>
+
+				{#if settingMode === 'timed_respawn'}
+					<div class="settings-row">
+						<span class="settings-label">復活待機</span>
+						<div class="settings-inline">
+							<input class="settings-num" type="number" min="5" max="300" bind:value={settingRespawnSec} />
+							<span class="settings-unit">秒</span>
+						</div>
+					</div>
+				{/if}
+
+				<div class="settings-row">
+					<span class="settings-label">チーム数</span>
+					<div class="settings-team-btns">
+						{#each [2,3,4] as n}
+							<button
+								class="settings-team-btn {settingTeamCount === n ? 'active' : ''}"
+								onclick={() => settingTeamCount = n}
+							>{n}</button>
+						{/each}
+					</div>
+				</div>
+
+				<div class="settings-team-names">
+					{#each Array(settingTeamCount) as _, i}
+						<input
+							class="settings-team-name-input"
+							type="text"
+							placeholder="チーム{['A','B','C','D'][i]}"
+							bind:value={settingTeamNames[i]}
+						/>
+					{/each}
+				</div>
+
+				<button class="settings-save-btn" onclick={saveMatchSettings} disabled={savingSettings}>
+					{savingSettings ? '保存中…' : '💾 設定を保存'}
+				</button>
+			</div>
+
 			<button class="join-start-btn" onclick={advanceStatus} disabled={updatingStatus}>
 				{updatingStatus ? '…' : '▶ 試合開始'}
 			</button>
@@ -969,6 +1066,105 @@
 	}
 	.join-start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 	.join-start-btn:hover:not(:disabled) { background: #22c55e; }
+
+	/* ── 試合設定 ── */
+	.settings-section {
+		width: 100%;
+		background: rgba(255,255,255,0.03);
+		border: 1px solid rgba(255,255,255,0.08);
+		border-radius: 10px;
+		padding: 10px 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.settings-title {
+		font-size: 0.72rem;
+		font-weight: 700;
+		color: #6b7280;
+		letter-spacing: 0.05em;
+	}
+	.settings-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+	}
+	.settings-label {
+		font-size: 0.72rem;
+		color: #9ca3af;
+		white-space: nowrap;
+	}
+	.settings-select {
+		background: rgba(255,255,255,0.06);
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 6px;
+		color: #e5e5e5;
+		font-size: 0.72rem;
+		padding: 4px 6px;
+		flex: 1;
+	}
+	.settings-inline {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+	}
+	.settings-num {
+		width: 54px;
+		background: rgba(255,255,255,0.06);
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 6px;
+		color: #e5e5e5;
+		font-size: 0.8rem;
+		padding: 4px 6px;
+		text-align: center;
+	}
+	.settings-unit { font-size: 0.72rem; color: #9ca3af; }
+	.settings-team-btns { display: flex; gap: 4px; }
+	.settings-team-btn {
+		width: 30px;
+		height: 24px;
+		border-radius: 6px;
+		border: 1px solid rgba(255,255,255,0.12);
+		background: rgba(255,255,255,0.04);
+		color: rgba(255,255,255,0.4);
+		font-size: 0.8rem;
+		font-weight: 700;
+		cursor: pointer;
+	}
+	.settings-team-btn.active {
+		border-color: #4ade80;
+		background: rgba(74,222,128,0.15);
+		color: #4ade80;
+	}
+	.settings-team-names {
+		display: flex;
+		gap: 4px;
+		flex-wrap: wrap;
+	}
+	.settings-team-name-input {
+		flex: 1;
+		min-width: 60px;
+		background: rgba(255,255,255,0.06);
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 6px;
+		color: #e5e5e5;
+		font-size: 0.72rem;
+		padding: 4px 6px;
+	}
+	.settings-save-btn {
+		width: 100%;
+		padding: 7px;
+		background: rgba(74,222,128,0.1);
+		border: 1px solid rgba(74,222,128,0.3);
+		border-radius: 8px;
+		color: #4ade80;
+		font-size: 0.75rem;
+		font-weight: 700;
+		cursor: pointer;
+	}
+	.settings-save-btn:hover:not(:disabled) { background: rgba(74,222,128,0.2); }
+	.settings-save-btn:disabled { opacity: 0.5; }
 
 	/* ── ステータスバッジ（右上） ── */
 	.status-badges {
