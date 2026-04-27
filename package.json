@@ -1,0 +1,15 @@
+{
+  "name": "sabage-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sabage Trajectory Tracking & Replay System",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev:viewer": "pnpm --filter viewer dev",
+    "dev:tracker": "pnpm --filter tracker start",
+    "build:viewer": "pnpm --filter viewer build",
+    "typecheck": "pnpm -r run check"
+  }
+}
