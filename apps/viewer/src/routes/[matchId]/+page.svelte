@@ -613,7 +613,7 @@
 	<!-- QRコードモーダル -->
 	{#if showQR}
 		<div class="modal-overlay" onclick={() => showQR = false} role="button" tabindex="-1">
-			<div class="modal-box" onclick|stopPropagation>
+			<div class="modal-box" onclick={(e) => e.stopPropagation()}>
 				<h3 class="modal-title">📱 試合に参加</h3>
 				<p class="modal-sub">スマホのカメラでスキャンしてブラウザで開く</p>
 				<img
@@ -630,7 +630,7 @@
 	<!-- 統計モーダル -->
 	{#if showStats}
 		<div class="modal-overlay" onclick={() => showStats = false} role="button" tabindex="-1">
-			<div class="modal-box modal-wide" onclick|stopPropagation>
+			<div class="modal-box modal-wide" onclick={(e) => e.stopPropagation()}>
 				<h3 class="modal-title">📊 試合統計</h3>
 				{#if logs.length === 0}
 					<p class="modal-sub">データがありません</p>
