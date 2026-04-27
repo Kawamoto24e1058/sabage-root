@@ -36,6 +36,14 @@
 	let showQR = $state(false);
 	let showStats = $state(false);
 	let showHeatmap = $state(false);
+	let joinPanelDismissed = $state(false);
+
+	// 待機中は参加パネルを表示（dismissするまで）
+	$effect(() => {
+		if (match?.status === 'waiting' && !joinPanelDismissed) {
+			showQR = false; // QRモーダルは使わない（パネルで代替）
+		}
+	});
 
 	// 仮想マップ
 	let useVirtualMap = $state(false);
@@ -534,6 +542,7 @@
 		if (!match) return;
 		const next = STATUS_NEXT[match.status];
 		if (!next) return;
+		joinPanelDismissed = true; // 試合開始/終了でパネルを閉じる
 		updatingStatus = true;
 		try {
 			await updateDoc(doc(db, 'matches', matchId), { status: next });
@@ -609,6 +618,42 @@
 			<span class="badge badge-warn">⚠ 境界線未登録</span>
 		{/if}
 	</div>
+
+	<!-- 待機中：参加者募集パネル -->
+	{#if match?.status === 'waiting' && !joinPanelDismissed}
+		<div class="join-panel">
+			<div class="join-panel-header">
+				<span class="join-panel-title">📱 参加者を招待</span>
+				<button class="join-panel-close" onclick={() => joinPanelDismissed = true}>✕</button>
+			</div>
+			<p class="join-panel-sub">スマホのカメラでQRをスキャン</p>
+			<img
+				src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=e5e5e5&bgcolor=0a0a0a&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
+				alt="QR Code"
+				class="join-qr"
+			/>
+			<div class="join-url">/track/{matchId.slice(0,12)}…</div>
+			<div class="join-players">
+				{#if logs.length === 0}
+					<span class="join-players-none">まだ誰も参加していません</span>
+				{:else}
+					<span class="join-players-count">✅ {logs.length}人が参加済み</span>
+					<div class="join-player-list">
+						{#each logs as p}
+							<div class="join-player-item">
+								<span class="join-player-dot" style="background:{p.teamColor}"></span>
+								<span>{p.name || p.id}</span>
+								<span class="join-player-team">チーム{p.team ?? '?'}</span>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
+			<button class="join-start-btn" onclick={advanceStatus} disabled={updatingStatus}>
+				{updatingStatus ? '…' : '▶ 試合開始'}
+			</button>
+		</div>
+	{/if}
 
 	<!-- QRコードモーダル -->
 	{#if showQR}
@@ -789,6 +834,125 @@
 		font-weight: 600;
 		text-align: center;
 	}
+
+	/* ── 待機中参加パネル ── */
+	.join-panel {
+		position: absolute;
+		top: 50%;
+		left: 20px;
+		transform: translateY(-50%);
+		z-index: 800;
+		background: rgba(10,10,10,0.94);
+		backdrop-filter: blur(20px);
+		border: 1px solid rgba(74,222,128,0.3);
+		border-radius: 18px;
+		padding: 18px 20px;
+		width: 220px;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 10px;
+		box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+	}
+	.join-panel-header {
+		width: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+	.join-panel-title {
+		font-size: 0.88rem;
+		font-weight: 800;
+		color: #4ade80;
+	}
+	.join-panel-close {
+		background: none;
+		border: none;
+		color: #6b7280;
+		font-size: 0.85rem;
+		cursor: pointer;
+		padding: 2px 4px;
+		line-height: 1;
+	}
+	.join-panel-close:hover { color: #e5e5e5; }
+	.join-panel-sub {
+		font-size: 0.7rem;
+		color: #9ca3af;
+		margin: 0;
+		text-align: center;
+	}
+	.join-qr {
+		width: 160px;
+		height: 160px;
+		border-radius: 10px;
+		border: 1px solid rgba(255,255,255,0.08);
+	}
+	.join-url {
+		font-size: 0.65rem;
+		font-family: monospace;
+		color: #6b7280;
+		background: rgba(255,255,255,0.04);
+		border: 1px solid rgba(255,255,255,0.08);
+		padding: 4px 8px;
+		border-radius: 6px;
+		width: 100%;
+		text-align: center;
+		box-sizing: border-box;
+	}
+	.join-players { width: 100%; }
+	.join-players-none {
+		font-size: 0.72rem;
+		color: #4b5563;
+		text-align: center;
+		display: block;
+	}
+	.join-players-count {
+		font-size: 0.75rem;
+		color: #4ade80;
+		font-weight: 700;
+		display: block;
+		text-align: center;
+		margin-bottom: 6px;
+	}
+	.join-player-list {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		max-height: 100px;
+		overflow-y: auto;
+	}
+	.join-player-item {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 0.72rem;
+		color: #d1d5db;
+	}
+	.join-player-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+	.join-player-team {
+		margin-left: auto;
+		color: #6b7280;
+		font-size: 0.65rem;
+	}
+	.join-start-btn {
+		width: 100%;
+		padding: 12px;
+		background: #4ade80;
+		color: #000;
+		border: none;
+		border-radius: 10px;
+		font-size: 0.9rem;
+		font-weight: 800;
+		cursor: pointer;
+		margin-top: 2px;
+	}
+	.join-start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+	.join-start-btn:hover:not(:disabled) { background: #22c55e; }
 
 	/* ── ステータスバッジ（右上） ── */
 	.status-badges {

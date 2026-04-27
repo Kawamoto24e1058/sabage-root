@@ -3,8 +3,8 @@
 	import { page } from '$app/state';
 	import { db, auth } from '$lib/firebase';
 	import { signInAnonymously } from 'firebase/auth';
-	import { doc, setDoc, updateDoc, serverTimestamp } from 'firebase/firestore';
-	import type { RoutePoint } from 'shared-types';
+	import { doc, setDoc, updateDoc, serverTimestamp, getDoc, collection, addDoc } from 'firebase/firestore';
+	import type { RoutePoint, Field, SpawnPoint } from 'shared-types';
 
 	const matchId = page.params.matchId;
 
@@ -17,13 +17,23 @@
 		{ label: 'オレンジ', value: '#f97316' },
 	];
 
-	type Screen = 'setup' | 'tracking' | 'done';
+	type Screen = 'setup' | 'spawn' | 'tracking' | 'done';
 	let screen = $state<Screen>('setup');
 
 	// Setup
 	let playerName = $state('');
 	let selectedTeam = $state<'A' | 'B'>('A');
 	let selectedColor = $state(TEAM_COLORS[0].value);
+
+	// Spawn selection
+	let field = $state<Field | null>(null);
+	let spawnPoints = $state<SpawnPoint[]>([]);
+	let selectedSpawnId = $state<string | null>(null);
+	let spawnGpsLat = $state<number | null>(null);
+	let spawnGpsLng = $state<number | null>(null);
+	let spawnGpsAccuracy = $state<number | null>(null);
+	let spawnConfirming = $state(false);
+	let spawnWatchId: number | null = null;
 
 	// Tracking
 	let routeDisplay = $state<RoutePoint[]>([]);
@@ -75,9 +85,76 @@
 
 	function cleanup() {
 		if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+		if (spawnWatchId !== null) { navigator.geolocation.clearWatch(spawnWatchId); spawnWatchId = null; }
 		if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
 		if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 		if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; wakeLockActive = false; }
+	}
+
+	// セットアップ完了 → スポーン選択 or 直接トラッキング
+	async function handleSetupNext() {
+		if (!uid) return;
+		// フィールド取得
+		try {
+			const matchDoc = await getDoc(doc(db, 'matches', matchId));
+			if (matchDoc.exists()) {
+				const matchData = matchDoc.data();
+				if (matchData.fieldId) {
+					const fieldDoc = await getDoc(doc(db, 'fields', matchData.fieldId));
+					if (fieldDoc.exists()) {
+						field = fieldDoc.data() as Field;
+						spawnPoints = field.spawnPoints ?? [];
+					}
+				}
+			}
+		} catch (e) {
+			console.warn('Field fetch failed:', e);
+		}
+
+		if (spawnPoints.length > 0) {
+			screen = 'spawn';
+			// GPS先読み開始（スポーンに到着してからタップするとき精度が出やすい）
+			spawnWatchId = navigator.geolocation.watchPosition(
+				(pos) => {
+					spawnGpsLat = pos.coords.latitude;
+					spawnGpsLng = pos.coords.longitude;
+					spawnGpsAccuracy = Math.round(pos.coords.accuracy);
+				},
+				() => {},
+				{ enableHighAccuracy: true, maximumAge: 0 }
+			);
+		} else {
+			startTracking();
+		}
+	}
+
+	// スポーンマーカータップ → キャリブレーション書き込み → トラッキング開始
+	async function selectSpawn(spawn: SpawnPoint) {
+		if (!uid || spawnConfirming) return;
+		spawnConfirming = true;
+
+		if (spawnGpsLat !== null && spawnGpsLng !== null) {
+			try {
+				await addDoc(collection(db, 'matches', matchId, 'calibrations'), {
+					spawnId: spawn.id,
+					lat: spawnGpsLat,
+					lng: spawnGpsLng,
+					uid,
+					timestamp: serverTimestamp(),
+				});
+			} catch (e) {
+				console.warn('Calibration write failed:', e);
+			}
+		}
+
+		selectedSpawnId = spawn.id;
+		// スポーンGPS監視を停止（trackingで再開する）
+		if (spawnWatchId !== null) {
+			navigator.geolocation.clearWatch(spawnWatchId);
+			spawnWatchId = null;
+		}
+		spawnConfirming = false;
+		startTracking();
 	}
 
 	async function requestWakeLock() {
@@ -109,6 +186,7 @@
 			team: selectedTeam,
 			route: [],
 			lastPosition: null,
+			...(selectedSpawnId ? { spawnId: selectedSpawnId } : {}),
 			startedAt: serverTimestamp(),
 			updatedAt: serverTimestamp(),
 		});
@@ -260,13 +338,72 @@
 	<button
 		class="start-btn"
 		style="--color: {selectedColor}"
-		onclick={startTracking}
+		onclick={handleSetupNext}
 		disabled={!uid}
 	>
-		{uid ? 'トラッキング開始' : '接続中…'}
+		{uid ? '次へ →' : '接続中…'}
 	</button>
 
 	<p class="wake-note">📱 画面は自動的にオフになりません<br>ポケットに入れても記録されます</p>
+</div>
+
+<!-- ══════════════════════════════════════════ -->
+<!-- Spawn Selection Screen                     -->
+<!-- ══════════════════════════════════════════ -->
+{:else if screen === 'spawn'}
+<div class="screen spawn-screen">
+	<div class="spawn-header">
+		<div class="spawn-title">📍 スタート位置を選択</div>
+		<div class="spawn-sub">自分がいるスポーンのマークをタップ</div>
+	</div>
+
+	<!-- GPS精度インジケーター -->
+	<div class="spawn-gps-bar">
+		{#if spawnGpsAccuracy === null}
+			<span class="gps-dot gps-waiting"></span> GPS取得中…
+		{:else if spawnGpsAccuracy <= 15}
+			<span class="gps-dot gps-ok"></span> GPS精度: ±{spawnGpsAccuracy}m　タップ可能
+		{:else}
+			<span class="gps-dot gps-waiting"></span> GPS精度: ±{spawnGpsAccuracy}m　待機中…
+		{/if}
+	</div>
+
+	<!-- フィールドマップ + スポーンマーカー -->
+	<div class="spawn-map-wrap">
+		{#if field?.mapImage?.url}
+			<img src={field.mapImage.url} alt="フィールドマップ" class="spawn-map-img" />
+		{:else if field?.virtualBoundary && field.virtualBoundary.length >= 3}
+			<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="spawn-map-svg">
+				<polygon
+					points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x * 100},${p.y * 100}`).join(' ')}
+					fill="rgba(74,222,128,0.1)"
+					stroke="#4ade80"
+					stroke-width="0.8"
+				/>
+			</svg>
+		{/if}
+
+		<!-- スポーンマーカー（絶対配置） -->
+		{#each spawnPoints as sp, i}
+			<button
+				class="spawn-marker {selectedSpawnId === sp.id ? 'spawn-marker-done' : ''}"
+				style="left: {sp.x * 100}%; top: {sp.y * 100}%;"
+				onclick={() => selectSpawn(sp)}
+				disabled={spawnConfirming}
+			>
+				<div class="spawn-circle">{i + 1}</div>
+				<div class="spawn-label">{sp.label}</div>
+			</button>
+		{/each}
+
+		{#if spawnConfirming}
+			<div class="spawn-confirming">記録中…</div>
+		{/if}
+	</div>
+
+	<button class="skip-btn" onclick={() => startTracking()}>
+		スキップ（キャリブレーションなし）
+	</button>
 </div>
 
 <!-- ══════════════════════════════════════════ -->
@@ -458,6 +595,118 @@
 		color: #4b5563;
 		line-height: 1.5;
 		margin: 0;
+	}
+
+	/* ── Spawn ── */
+	.spawn-screen {
+		gap: 16px;
+		padding-top: max(env(safe-area-inset-top), 32px);
+	}
+	.spawn-header { text-align: center; }
+	.spawn-title { font-size: 1.2rem; font-weight: 800; }
+	.spawn-sub { font-size: 0.8rem; color: #6b7280; margin-top: 4px; }
+
+	.spawn-gps-bar {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 0.82rem;
+		color: #9ca3af;
+		background: rgba(255,255,255,0.04);
+		border: 1px solid rgba(255,255,255,0.08);
+		border-radius: 10px;
+		padding: 10px 14px;
+	}
+
+	.spawn-map-wrap {
+		position: relative;
+		flex: 1;
+		min-height: 0;
+		background: rgba(255,255,255,0.03);
+		border: 1px solid rgba(255,255,255,0.08);
+		border-radius: 16px;
+		overflow: hidden;
+	}
+	.spawn-map-img {
+		width: 100%;
+		height: 100%;
+		object-fit: contain;
+		display: block;
+	}
+	.spawn-map-svg {
+		width: 100%;
+		height: 100%;
+	}
+
+	.spawn-marker {
+		position: absolute;
+		transform: translate(-50%, -50%);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 4px;
+		background: none;
+		border: none;
+		cursor: pointer;
+		padding: 0;
+		z-index: 10;
+	}
+	.spawn-circle {
+		width: 44px;
+		height: 44px;
+		border-radius: 50%;
+		background: rgba(10,10,10,0.9);
+		border: 2.5px solid #4ade80;
+		color: #4ade80;
+		font-size: 16px;
+		font-weight: 800;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		box-shadow: 0 0 0 6px rgba(74,222,128,0.15), 0 4px 12px rgba(0,0,0,0.7);
+		transition: transform 0.15s, box-shadow 0.15s;
+	}
+	.spawn-marker:active .spawn-circle {
+		transform: scale(0.92);
+		box-shadow: 0 0 0 10px rgba(74,222,128,0.25);
+	}
+	.spawn-marker-done .spawn-circle {
+		background: #4ade80;
+		color: #000;
+		box-shadow: 0 0 0 8px rgba(74,222,128,0.3);
+	}
+	.spawn-label {
+		font-size: 0.65rem;
+		font-weight: 700;
+		color: #e5e5e5;
+		background: rgba(10,10,10,0.85);
+		border: 1px solid rgba(74,222,128,0.4);
+		border-radius: 5px;
+		padding: 2px 6px;
+		white-space: nowrap;
+	}
+
+	.spawn-confirming {
+		position: absolute;
+		inset: 0;
+		background: rgba(10,10,10,0.6);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 1rem;
+		font-weight: 700;
+		color: #4ade80;
+	}
+
+	.skip-btn {
+		background: none;
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 12px;
+		padding: 14px;
+		color: #6b7280;
+		font-size: 0.85rem;
+		cursor: pointer;
+		width: 100%;
 	}
 
 	/* ── Tracking ── */
