@@ -234,7 +234,25 @@
 						});
 
 					if (calibPairs.length >= 2) {
+						// 2点以上: フル変換（回転・スケール・平行移動）
 						gpsTransform = buildGpsTransform(calibPairs);
+						calibStatus = 'ready';
+					} else if (calibPairs.length === 1 && field?.fieldWidthMeters) {
+						// 1点 + フィールド幅: スポーンを原点とした相対変換
+						const p = calibPairs[0];
+						// pixels/degree: imgWピクセル = fieldWidthMeters(m) ÷ cos補正
+						const latRad = p.lat * Math.PI / 180;
+						const metersPerDegLng = 111320 * Math.cos(latRad);
+						const metersPerDegLat = 111320;
+						const pxPerM = imgW / field.fieldWidthMeters;
+						const pxPerDegLng = pxPerM * metersPerDegLng;
+						const pxPerDegLat = pxPerM * metersPerDegLat;
+						gpsTransform = (lat: number, lng: number): [number, number] => {
+							const dpx = (lng - p.lng) * pxPerDegLng;
+							const dpy = (lat - p.lat) * pxPerDegLat;
+							// Leaflet CRS.Simple: y軸上方向 = py増加 → lat増加
+							return [p.py + dpy, p.px + dpx];
+						};
 						calibStatus = 'ready';
 					} else {
 						calibStatus = 'insufficient';

@@ -16,6 +16,56 @@
 	let addMode = $state(false);
 
 	let spawnPoints = $state<SpawnPoint[]>([]);
+	let fieldWidthMeters = $state<number>(80); // フィールド横幅（実寸m）
+
+	// 外周GPS計測
+	let measuring = $state(false);
+	let measurePts = $state<{lat: number; lng: number}[]>([]);
+	let measureWatchId = $state<number | null>(null);
+	let measureStatus = $state(''); // 'recording' | 'done' | ''
+
+	function haversineM(a: {lat:number;lng:number}, b: {lat:number;lng:number}): number {
+		const R = 6371000;
+		const dLat = (b.lat - a.lat) * Math.PI / 180;
+		const dLng = (b.lng - a.lng) * Math.PI / 180;
+		const aa = Math.sin(dLat/2)**2 + Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+		return R * 2 * Math.atan2(Math.sqrt(aa), Math.sqrt(1-aa));
+	}
+
+	function startMeasure() {
+		if (!navigator.geolocation) { alert('このブラウザはGPS非対応です'); return; }
+		measurePts = [];
+		measuring = true;
+		measureStatus = 'recording';
+		let lastPt: {lat:number;lng:number} | null = null;
+		measureWatchId = navigator.geolocation.watchPosition(
+			(pos) => {
+				const pt = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+				if (!lastPt || haversineM(lastPt, pt) > 1) { // 1m以上動いたら記録
+					measurePts = [...measurePts, pt];
+					lastPt = pt;
+				}
+			},
+			(err) => { console.warn('GPS error', err); },
+			{ enableHighAccuracy: true, maximumAge: 0 }
+		);
+	}
+
+	function stopMeasure() {
+		if (measureWatchId !== null) { navigator.geolocation.clearWatch(measureWatchId); measureWatchId = null; }
+		measuring = false;
+		if (measurePts.length < 2) { measureStatus = ''; alert('GPS点が少なすぎます。もう少し歩いてください。'); return; }
+		// 全点ペア間の最大距離を横幅とする
+		let maxD = 0;
+		for (let i = 0; i < measurePts.length; i++) {
+			for (let j = i+1; j < measurePts.length; j++) {
+				const d = haversineM(measurePts[i], measurePts[j]);
+				if (d > maxD) maxD = d;
+			}
+		}
+		fieldWidthMeters = Math.round(maxD);
+		measureStatus = 'done';
+	}
 
 	let mapElement: HTMLDivElement;
 	let map: any = null;
@@ -31,6 +81,7 @@
 			if (!snap.exists()) { loadError = 'フィールドが見つかりません'; loading = false; return; }
 			field = { id: snap.id, ...snap.data() } as Field & { id: string };
 			spawnPoints = [...(field.spawnPoints ?? [])];
+			if (field.fieldWidthMeters) fieldWidthMeters = field.fieldWidthMeters;
 		} catch (e) {
 			loadError = '読み込みに失敗しました';
 			loading = false;
@@ -101,6 +152,7 @@
 
 	onDestroy(() => {
 		if (map) { map.remove(); map = null; }
+		if (measureWatchId !== null) { navigator.geolocation.clearWatch(measureWatchId); }
 	});
 
 	function renderMarkers() {
@@ -167,7 +219,8 @@
 		saving = true;
 		try {
 			await updateDoc(doc(db, 'fields', fieldId), {
-				spawnPoints: spawnPoints.map(({ id, label, x, y }) => ({ id, label, x, y }))
+				spawnPoints: spawnPoints.map(({ id, label, x, y }) => ({ id, label, x, y })),
+				fieldWidthMeters: Number(fieldWidthMeters) || 80,
 			});
 			goto('/');
 		} catch (e) {
@@ -273,6 +326,35 @@
 						<p class="ok">✓ {spawnPoints.length}点設定済み — 精度向上には離れた2点が重要です</p>
 					{/if}
 				{/if}
+
+				<!-- フィールド横幅設定 -->
+				<div class="field-width-row">
+					<label class="field-width-label">📐 フィールド実寸（最大幅）</label>
+
+					<!-- GPS計測ボタン -->
+					{#if !measuring}
+						<button class="measure-btn" onclick={startMeasure}>
+							🚶 外周を歩いて自動計測
+						</button>
+					{:else}
+						<div class="measuring-state">
+							<div class="measure-pulse">● 計測中 — {measurePts.length}点取得</div>
+							<button class="measure-stop-btn" onclick={stopMeasure}>
+								✅ 計測完了
+							</button>
+						</div>
+					{/if}
+
+					{#if measureStatus === 'done'}
+						<p class="measure-result">✓ 計測結果: <strong>{fieldWidthMeters} m</strong> を設定しました</p>
+					{/if}
+
+					<div class="field-width-input-wrap">
+						<input class="field-width-input" type="number" min="10" max="2000" bind:value={fieldWidthMeters} />
+						<span class="field-width-unit">m（手動入力も可）</span>
+					</div>
+					<p class="field-width-hint">スポーン1点でのGPS位置推定に使います。スマホで外周を1周歩くと自動計算されます。</p>
+				</div>
 
 				<div class="how-to">
 					<p class="how-to-title">使い方</p>
@@ -453,6 +535,45 @@
 
 	.warn { font-size: 0.75rem; color: #facc15; margin: 0; }
 	.ok { font-size: 0.75rem; color: #4ade80; margin: 0; line-height: 1.5; }
+
+	.field-width-row { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }
+	.field-width-label { font-size: 0.75rem; font-weight: 700; color: #9ca3af; }
+
+	.measure-btn {
+		width: 100%; padding: 10px;
+		background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.3);
+		border-radius: 10px; color: #60a5fa; font-size: 0.82rem; font-weight: 600;
+		cursor: pointer; transition: all 0.15s;
+	}
+	.measure-btn:hover { background: rgba(96,165,250,0.16); }
+
+	.measuring-state {
+		display: flex; flex-direction: column; gap: 6px;
+		background: rgba(96,165,250,0.05); border: 1px solid rgba(96,165,250,0.25);
+		border-radius: 10px; padding: 10px;
+	}
+	.measure-pulse {
+		font-size: 0.8rem; color: #60a5fa; font-weight: 600;
+		animation: pulse 1.2s ease-in-out infinite;
+	}
+	@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+	.measure-stop-btn {
+		background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.4);
+		border-radius: 8px; color: #4ade80; font-size: 0.82rem; font-weight: 700;
+		padding: 7px; cursor: pointer; transition: all 0.15s;
+	}
+	.measure-stop-btn:hover { background: rgba(74,222,128,0.2); }
+
+	.measure-result { font-size: 0.78rem; color: #4ade80; margin: 0; }
+	.measure-result strong { font-size: 0.9rem; }
+
+	.field-width-input-wrap { display: flex; align-items: center; gap: 6px; }
+	.field-width-input {
+		width: 80px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 8px; color: #e5e5e5; font-size: 0.9rem; padding: 6px 10px; text-align: center;
+	}
+	.field-width-unit { font-size: 0.78rem; color: #6b7280; }
+	.field-width-hint { font-size: 0.7rem; color: #4b5563; margin: 0; }
 
 	.how-to {
 		margin-top: auto; padding-top: 14px;

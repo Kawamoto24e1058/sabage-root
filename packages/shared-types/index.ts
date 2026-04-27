@@ -45,9 +45,10 @@ export interface Field {
   name: string;
   boundary: GeoPoint[];
   mapImage?: MapImage;
-  spawnPoints?: SpawnPoint[];       // 仮想マップのキャリブレーション用スポーン地点
-  virtualBoundary?: VirtualPoint[]; // AI検出フィールド外周（画像座標 0-1）
-  obstacles?: ObstacleLine[];        // AI検出障害物（画像座標 0-1）
+  spawnPoints?: SpawnPoint[];
+  virtualBoundary?: VirtualPoint[];
+  obstacles?: ObstacleLine[];
+  fieldWidthMeters?: number; // フィールドの実際の横幅(m) — 1点キャリブレーション用
 }
 
 export type MatchStatus = 'waiting' | 'playing' | 'finished';
