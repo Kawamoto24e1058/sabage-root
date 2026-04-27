@@ -49,14 +49,50 @@
 	let authError = $state(false);
 	let trackingError = $state<string | null>(null);
 
+	// ── Kalmanフィルター（GPS平滑化）──────────────────────────────────────
+	// GPS座標のノイズをベイズ的に抑える。lat/lngそれぞれに1インスタンス使う。
+	// q: プロセスノイズ（小さいほど「前の推定」を信頼）
+	// r: 観測ノイズ（大きいほどGPS測定値を疑う）
+	class KalmanFilter1D {
+		private q: number;
+		private r: number;
+		private p = 1;
+		private x = 0;
+		private initialized = false;
+
+		constructor(q = 0.000001, r = 0.0001) {
+			this.q = q;
+			this.r = r;
+		}
+
+		filter(measurement: number, accuracy = 10): number {
+			if (!this.initialized) {
+				this.x = measurement;
+				this.initialized = true;
+				return measurement;
+			}
+			// GPS精度が悪いほど観測ノイズを増やす（測定値を信じにくくする）
+			const r = this.r * Math.max(1, accuracy / 5);
+			this.p += this.q;
+			const k = this.p / (this.p + r);
+			this.x += k * (measurement - this.x);
+			this.p *= (1 - k);
+			return this.x;
+		}
+
+		reset() { this.initialized = false; }
+	}
+
 	// Refs (outside reactive state to avoid stale closures)
 	let routeRef: RoutePoint[] = [];
 	let lastRoutePoint: RoutePoint | null = null;
 	let watchId: number | null = null;
 	let syncInterval: ReturnType<typeof setInterval> | null = null;
 	let timerInterval: ReturnType<typeof setInterval> | null = null;
+	let kalmanLat = new KalmanFilter1D();
+	let kalmanLng = new KalmanFilter1D();
 
-	const MAX_JUMP_METERS = 50;
+	const MAX_JUMP_METERS = 80; // Kalmanで平滑化するので少し緩める
 
 	function haversineM(lat1: number, lng1: number, lat2: number, lng2: number): number {
 		const R = 6371000;
@@ -176,6 +212,8 @@
 		lastRoutePoint = null;
 		elapsed = 0;
 		gpsStatus = 'waiting';
+		kalmanLat.reset();
+		kalmanLng.reset();
 
 		await requestWakeLock();
 
@@ -202,12 +240,20 @@
 		watchId = navigator.geolocation.watchPosition(
 			async (pos) => {
 				gpsStatus = 'ok';
-				lastAccuracy = Math.round(pos.coords.accuracy);
+				const accuracy = pos.coords.accuracy;
+				lastAccuracy = Math.round(accuracy);
+
+				// Kalmanフィルターでノイズ除去
+				const smoothedLat = kalmanLat.filter(pos.coords.latitude, accuracy);
+				const smoothedLng = kalmanLng.filter(pos.coords.longitude, accuracy);
+
 				const newPoint: RoutePoint = {
-					lat: pos.coords.latitude,
-					lng: pos.coords.longitude,
+					lat: smoothedLat,
+					lng: smoothedLng,
 					timestamp: pos.timestamp,
 				};
+
+				// 急ジャンプ除去（Kalman後でも稀に発生するアウトライアーを弾く）
 				if (lastRoutePoint) {
 					const d = haversineM(lastRoutePoint.lat, lastRoutePoint.lng, newPoint.lat, newPoint.lng);
 					if (d > MAX_JUMP_METERS) return;

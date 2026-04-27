@@ -51,6 +51,10 @@
 	let currentFieldId = $state('');
 	// GPS(lat,lng) → Leaflet CRS.Simple の [y,x] ピクセル座標
 	let gpsTransform: ((lat: number, lng: number) => [number, number]) | null = null;
+	// スポーン地点（フォールバック表示用）
+	let spawnPointsState = $state<SpawnPoint[]>([]);
+	let virtualImgW = $state(1000);
+	let virtualImgH = $state(1000);
 
 	let unsubscribeLogs: () => void;
 	let unsubscribeMatch: () => void;
@@ -125,6 +129,7 @@
 			if (fieldDoc.exists()) {
 				field = fieldDoc.data() as Field;
 				spawnPoints = field.spawnPoints ?? [];
+				spawnPointsState = spawnPoints; // $effect から参照できるよう保存
 				mapImageUrl = field.mapImage?.url ?? '';
 			}
 		}
@@ -144,6 +149,8 @@
 				imgW = 1000; imgH = 1000;
 			}
 			useVirtualMap = true;
+			virtualImgW = imgW;
+			virtualImgH = imgH;
 
 			map = L.map(mapElement, { crs: L.CRS.Simple, minZoom: -5, maxZoom: 5, attributionControl: false });
 
@@ -418,31 +425,33 @@
 			const name = player.name || playerId;
 			const isHit = !!player.hitEvent;
 
-			// レイヤーが未作成なら polyline だけ初期化（markerは位置が来てから追加）
+			// Liveモードはマーカーのみ（軌跡はリプレイで見る）
 			if (!playerLayers[playerId]) {
 				playerLayers[playerId] = {
-					polyline: L.polyline([], {
-						color,
-						weight: 2.5,
-						opacity: 0.6
-					}).addTo(map),
-					marker: null,   // 位置が来るまでnull
+					polyline: null,   // Liveでは使わない
+					marker: null,     // 位置が来てから追加
 					hitMarker: null
 				};
 			}
 
-			// 軌跡（全ルート）
-			if (player.route.length > 0) {
-				const latLngs = player.route.map(p => toMapCoords(p.lat, p.lng));
-				playerLayers[playerId].polyline.setLatLngs(latLngs);
+			// 現在位置を決定
+			// 優先順位: GPS変換済み座標 > スポーン位置フォールバック（キャリブ不足時）
+			const pos = player.lastPosition ?? player.route[player.route.length - 1];
+			let latLng: [number, number] | null = null;
+
+			if (pos && (!useVirtualMap || gpsTransform)) {
+				// 通常: GPS座標を変換
+				latLng = toMapCoords(pos.lat, pos.lng);
+			} else if (useVirtualMap && !gpsTransform && (player as any).spawnId) {
+				// フォールバック: キャリブレーション不足のときはスポーン位置に表示
+				const sp = spawnPointsState.find(s => s.id === (player as any).spawnId);
+				if (sp) {
+					latLng = [(1 - sp.y) * virtualImgH, sp.x * virtualImgW];
+				}
 			}
 
-			// 現在位置（lastPosition 優先、なければ route 末尾）
-			const pos = player.lastPosition ?? player.route[player.route.length - 1];
-			if (pos) {
-				const latLng = toMapCoords(pos.lat, pos.lng);
+			if (latLng) {
 				if (!playerLayers[playerId].marker) {
-					// 初回：マーカーを生成してマップに追加
 					playerLayers[playerId].marker = L.marker(latLng, {
 						icon: makePlayerIcon(color, name, isHit),
 						zIndexOffset: 100,
