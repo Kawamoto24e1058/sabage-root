@@ -47,6 +47,7 @@
 	// Auth
 	let uid = $state<string | null>(null);
 	let authError = $state(false);
+	let trackingError = $state<string | null>(null);
 
 	// Refs (outside reactive state to avoid stale closures)
 	let routeRef: RoutePoint[] = [];
@@ -180,16 +181,22 @@
 
 		// Firestoreドキュメント初期化
 		const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
-		await setDoc(logRef, {
-			name: playerName.trim() || `Player_${uid.slice(0, 4).toUpperCase()}`,
-			teamColor: selectedColor,
-			team: selectedTeam,
-			route: [],
-			lastPosition: null,
-			...(selectedSpawnId ? { spawnId: selectedSpawnId } : {}),
-			startedAt: serverTimestamp(),
-			updatedAt: serverTimestamp(),
-		});
+		try {
+			await setDoc(logRef, {
+				name: playerName.trim() || `Player_${uid.slice(0, 4).toUpperCase()}`,
+				teamColor: selectedColor,
+				team: selectedTeam,
+				route: [],
+				lastPosition: null,
+				...(selectedSpawnId ? { spawnId: selectedSpawnId } : {}),
+				startedAt: serverTimestamp(),
+				updatedAt: serverTimestamp(),
+			});
+			trackingError = null;
+		} catch (e: any) {
+			trackingError = e?.message ?? String(e);
+			console.error('setDoc failed:', e);
+		}
 
 		// GPS追跡開始
 		watchId = navigator.geolocation.watchPosition(
@@ -360,41 +367,83 @@
 	<!-- GPS精度インジケーター -->
 	<div class="spawn-gps-bar">
 		{#if spawnGpsAccuracy === null}
-			<span class="gps-dot gps-waiting"></span> GPS取得中…
+			<span class="gps-dot gps-waiting"></span> GPS取得中… (タップ可能)
 		{:else if spawnGpsAccuracy <= 15}
-			<span class="gps-dot gps-ok"></span> GPS精度: ±{spawnGpsAccuracy}m　タップ可能
+			<span class="gps-dot gps-ok"></span> GPS精度: ±{spawnGpsAccuracy}m
 		{:else}
-			<span class="gps-dot gps-waiting"></span> GPS精度: ±{spawnGpsAccuracy}m　待機中…
+			<span class="gps-dot gps-waiting"></span> GPS精度: ±{spawnGpsAccuracy}m
 		{/if}
 	</div>
 
-	<!-- フィールドマップ + スポーンマーカー -->
+	<!-- フィールドマップ + スポーンマーカー（SVG） -->
 	<div class="spawn-map-wrap">
-		{#if field?.mapImage?.url}
-			<img src={field.mapImage.url} alt="フィールドマップ" class="spawn-map-img" />
-		{:else if field?.virtualBoundary && field.virtualBoundary.length >= 3}
-			<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="spawn-map-svg">
+		{#if field?.virtualBoundary && field.virtualBoundary.length >= 3}
+			<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="spawn-map-svg"
+				style="width:100%;height:100%;">
+				<!-- グロー効果 -->
 				<polygon
-					points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x * 100},${p.y * 100}`).join(' ')}
+					points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x*100},${p.y*100}`).join(' ')}
 					fill="rgba(74,222,128,0.1)"
-					stroke="#4ade80"
-					stroke-width="0.8"
+					stroke="rgba(74,222,128,0.15)"
+					stroke-width="2.5"
 				/>
+				<!-- 外周線 -->
+				<polygon
+					points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x*100},${p.y*100}`).join(' ')}
+					fill="none"
+					stroke="#4ade80"
+					stroke-width="0.7"
+				/>
+				<!-- スポーンマーカー -->
+				{#each spawnPoints as sp, i}
+					{@const done = selectedSpawnId === sp.id}
+					<g onclick={() => !spawnConfirming && selectSpawn(sp)} style="cursor:pointer;">
+						<!-- タップ領域を広げる透明円 -->
+						<circle cx={sp.x*100} cy={sp.y*100} r="8" fill="transparent" />
+						<!-- 外周グロー -->
+						<circle cx={sp.x*100} cy={sp.y*100} r="5.5"
+							fill="none" stroke="rgba(74,222,128,0.2)" stroke-width="2.5" />
+						<!-- メイン円 -->
+						<circle cx={sp.x*100} cy={sp.y*100} r="4.5"
+							fill={done ? '#4ade80' : 'rgba(10,10,10,0.92)'}
+							stroke="#4ade80" stroke-width="0.7" />
+						<!-- 番号 -->
+						<text x={sp.x*100} y={sp.y*100}
+							fill={done ? '#000' : '#4ade80'}
+							font-size="3.2" font-weight="bold"
+							text-anchor="middle" dominant-baseline="central"
+							pointer-events="none">{i+1}</text>
+						<!-- ラベル背景 -->
+						<rect
+							x={sp.x*100 - 9} y={sp.y*100 - 10}
+							width="18" height="4.5" rx="1"
+							fill="rgba(10,10,10,0.88)"
+							stroke="rgba(74,222,128,0.35)" stroke-width="0.3"
+						/>
+						<!-- ラベルテキスト -->
+						<text x={sp.x*100} y={sp.y*100 - 7.7}
+							fill="#e5e5e5" font-size="2.5"
+							text-anchor="middle" dominant-baseline="central"
+							pointer-events="none">{sp.label}</text>
+					</g>
+				{/each}
 			</svg>
+		{:else if field?.mapImage?.url}
+			<img src={field.mapImage.url} alt="フィールドマップ" class="spawn-map-img" />
+			{#each spawnPoints as sp, i}
+				<button
+					class="spawn-marker {selectedSpawnId === sp.id ? 'spawn-marker-done' : ''}"
+					style="left: {sp.x * 100}%; top: {sp.y * 100}%;"
+					onclick={() => selectSpawn(sp)}
+					disabled={spawnConfirming}
+				>
+					<div class="spawn-circle">{i + 1}</div>
+					<div class="spawn-label">{sp.label}</div>
+				</button>
+			{/each}
+		{:else}
+			<div class="spawn-no-map">マップデータなし</div>
 		{/if}
-
-		<!-- スポーンマーカー（絶対配置） -->
-		{#each spawnPoints as sp, i}
-			<button
-				class="spawn-marker {selectedSpawnId === sp.id ? 'spawn-marker-done' : ''}"
-				style="left: {sp.x * 100}%; top: {sp.y * 100}%;"
-				onclick={() => selectSpawn(sp)}
-				disabled={spawnConfirming}
-			>
-				<div class="spawn-circle">{i + 1}</div>
-				<div class="spawn-label">{sp.label}</div>
-			</button>
-		{/each}
 
 		{#if spawnConfirming}
 			<div class="spawn-confirming">記録中…</div>
@@ -426,6 +475,13 @@
 		</div>
 		<div class="point-count">{routeDisplay.length}点</div>
 	</div>
+
+	<!-- Firestoreエラー -->
+	{#if trackingError}
+		<div class="wake-warn" style="border-color:rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#f87171;">
+			⚠ データ送信エラー: {trackingError}
+		</div>
+	{/if}
 
 	<!-- Wake Lock状態 -->
 	{#if !wakeLockActive}
@@ -626,6 +682,9 @@
 		border: 1px solid rgba(255,255,255,0.08);
 		border-radius: 16px;
 		overflow: hidden;
+		display: flex;
+		align-items: center;
+		justify-content: center;
 	}
 	.spawn-map-img {
 		width: 100%;
@@ -636,6 +695,10 @@
 	.spawn-map-svg {
 		width: 100%;
 		height: 100%;
+	}
+	.spawn-no-map {
+		color: #4b5563;
+		font-size: 0.85rem;
 	}
 
 	.spawn-marker {
