@@ -1,4 +1,4 @@
-import { GEMINI_API_KEY } from '$env/static/private';
+import { env } from '$env/dynamic/private';
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 
@@ -39,6 +39,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		throw error(400, 'imageBase64 and mimeType are required');
 	}
 
+	const GEMINI_API_KEY = env.GEMINI_API_KEY;
 	if (!GEMINI_API_KEY || GEMINI_API_KEY === 'your_gemini_api_key_here') {
 		throw error(500, 'GEMINI_API_KEY is not configured. Add it to .env');
 	}
