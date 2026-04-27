@@ -418,6 +418,7 @@
 			const name = player.name || playerId;
 			const isHit = !!player.hitEvent;
 
+			// レイヤーが未作成なら polyline だけ初期化（markerは位置が来てから追加）
 			if (!playerLayers[playerId]) {
 				playerLayers[playerId] = {
 					polyline: L.polyline([], {
@@ -425,10 +426,7 @@
 						weight: 2.5,
 						opacity: 0.6
 					}).addTo(map),
-					marker: L.marker([0, 0], {
-						icon: makePlayerIcon(color, name, isHit),
-						zIndexOffset: 100,
-					}).addTo(map),
+					marker: null,   // 位置が来るまでnull
 					hitMarker: null
 				};
 			}
@@ -442,8 +440,17 @@
 			// 現在位置（lastPosition 優先、なければ route 末尾）
 			const pos = player.lastPosition ?? player.route[player.route.length - 1];
 			if (pos) {
-				playerLayers[playerId].marker.setLatLng(toMapCoords(pos.lat, pos.lng));
-				playerLayers[playerId].marker.setIcon(makePlayerIcon(color, name, isHit));
+				const latLng = toMapCoords(pos.lat, pos.lng);
+				if (!playerLayers[playerId].marker) {
+					// 初回：マーカーを生成してマップに追加
+					playerLayers[playerId].marker = L.marker(latLng, {
+						icon: makePlayerIcon(color, name, isHit),
+						zIndexOffset: 100,
+					}).addTo(map);
+				} else {
+					playerLayers[playerId].marker.setLatLng(latLng);
+					playerLayers[playerId].marker.setIcon(makePlayerIcon(color, name, isHit));
+				}
 			}
 		});
 	});

@@ -200,7 +200,7 @@
 
 		// GPS追跡開始
 		watchId = navigator.geolocation.watchPosition(
-			(pos) => {
+			async (pos) => {
 				gpsStatus = 'ok';
 				lastAccuracy = Math.round(pos.coords.accuracy);
 				const newPoint: RoutePoint = {
@@ -215,6 +215,19 @@
 				lastRoutePoint = newPoint;
 				routeRef = [...routeRef, newPoint];
 				routeDisplay = routeRef;
+
+				// 初回GPS取得時はすぐにFirestoreへ書き込む（Viewerにリアルタイム表示）
+				if (routeRef.length === 1) {
+					try {
+						await updateDoc(logRef, {
+							route: routeRef,
+							lastPosition: newPoint,
+							updatedAt: serverTimestamp(),
+						});
+					} catch (e) {
+						console.warn('First position sync failed:', e);
+					}
+				}
 			},
 			(err) => {
 				gpsStatus = 'error';
@@ -223,7 +236,7 @@
 			{ enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
 		);
 
-		// 5秒ごとにFirestoreへ同期
+		// 3秒ごとにFirestoreへ同期（初回は watchPosition コールバック内で即時送信）
 		syncInterval = setInterval(async () => {
 			if (routeRef.length === 0) return;
 			const lastPoint = routeRef[routeRef.length - 1];
@@ -236,7 +249,7 @@
 			} catch (e) {
 				console.warn('Sync failed:', e);
 			}
-		}, 5000);
+		}, 3000);
 
 		// タイマー
 		timerInterval = setInterval(() => { elapsed++; }, 1000);
