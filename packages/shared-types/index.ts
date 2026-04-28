@@ -51,6 +51,15 @@ export interface Field {
   fieldWidthMeters?: number; // フィールドの実際の横幅(m) — 1点キャリブレーション用
 }
 
+// サバゲーイベント（1日の開催単位）
+export interface GameEvent {
+  id?: string;
+  name: string;       // 例: "第1回〇〇サバゲー"
+  date: number;       // 開催日 Unix timestamp
+  fieldId: string;    // 関連 Field ドキュメント ID
+  createdAt: number;
+}
+
 export type MatchStatus = 'waiting' | 'playing' | 'finished';
 
 // ゲームモード
@@ -67,6 +76,7 @@ export interface TeamConfig {
 export interface Match {
   id?: string;
   fieldId: string;
+  eventId?: string;   // 属するイベント ID
   createdAt: number;
   status: MatchStatus;
   gameMode?: GameMode;

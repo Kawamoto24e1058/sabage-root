@@ -60,6 +60,38 @@
 	let authError = $state(false);
 	let trackingError = $state<string | null>(null);
 
+	// ヒット演出
+	let hitFlashing = $state(false);
+	function triggerHitFlash() {
+		hitFlashing = true;
+		if (navigator.vibrate) navigator.vibrate([150, 80, 300]);
+		setTimeout(() => { hitFlashing = false; }, 1500);
+	}
+
+	// テスト用仮想ジョイスティック
+	let showJoystick = $state(false);
+	let joystickLat = $state(35.6895);
+	let joystickLng = $state(139.6917);
+	let joystickReady = $state(false);
+
+	const STEP = 0.000009; // ≈ 1m per tap
+
+	async function moveJoystick(dLat: number, dLng: number) {
+		if (!uid) return;
+		joystickLat += dLat;
+		joystickLng += dLng;
+		const newPoint: RoutePoint = { lat: joystickLat, lng: joystickLng, timestamp: Date.now() };
+		routeRef = [...routeRef, newPoint];
+		routeDisplay = routeRef;
+		gpsStatus = 'ok';
+		// 即時Firestore同期
+		const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+		try {
+			const { updateDoc: upd, serverTimestamp: sts } = await import('firebase/firestore');
+			await upd(logRef, { route: routeRef, lastPosition: newPoint, updatedAt: sts() });
+		} catch(e) { console.warn(e); }
+	}
+
 	// ── Kalmanフィルター（GPS平滑化）──────────────────────────────────────
 	// GPS座標のノイズをベイズ的に抑える。lat/lngそれぞれに1インスタンス使う。
 	// q: プロセスノイズ（小さいほど「前の推定」を信頼）
@@ -269,6 +301,13 @@
 				routeRef = [...routeRef, newPoint];
 				routeDisplay = routeRef;
 
+				// ジョイスティック初期位置を実GPS座標に合わせる
+				if (!joystickReady) {
+					joystickLat = smoothedLat;
+					joystickLng = smoothedLng;
+					joystickReady = true;
+				}
+
 				// 初回GPS取得時はすぐにFirestoreへ書き込む（Viewerにリアルタイム表示）
 				if (routeRef.length === 1) {
 					try {
@@ -345,6 +384,7 @@
 	}
 
 	async function handleHit() {
+		triggerHitFlash();
 		const last = routeRef[routeRef.length - 1];
 		const hitPos = last ? { lat: last.lat, lng: last.lng } : undefined;
 
@@ -582,6 +622,13 @@
 {:else if screen === 'tracking'}
 <div class="screen tracking-screen">
 
+	<!-- ヒットフラッシュオーバーレイ -->
+	{#if hitFlashing}
+		<div class="hit-flash-overlay">
+			<div class="hit-flash-text">HIT!</div>
+		</div>
+	{/if}
+
 	<!-- ステータスバー -->
 	<div class="status-bar">
 		<div class="timer">{formatTime(elapsed)}</div>
@@ -621,6 +668,37 @@
 		<span class="hit-icon">💀</span>
 		<span class="hit-label">ヒット</span>
 	</button>
+
+	<!-- テスト用ジョイスティック -->
+	<div class="joystick-toggle-row">
+		<button class="joystick-toggle" onclick={() => showJoystick = !showJoystick}>
+			🕹 テスト移動 {showJoystick ? '▲' : '▼'}
+		</button>
+	</div>
+
+	{#if showJoystick}
+		<div class="dpad">
+			<div class="dpad-row">
+				<button class="dpad-btn" onclick={() => moveJoystick(STEP * 5, 0)}>↑↑</button>
+			</div>
+			<div class="dpad-row">
+				<button class="dpad-btn" onclick={() => moveJoystick(STEP, 0)}>↑</button>
+			</div>
+			<div class="dpad-mid">
+				<button class="dpad-btn" onclick={() => moveJoystick(0, -STEP * 5)}>←←</button>
+				<button class="dpad-btn" onclick={() => moveJoystick(0, -STEP)}>←</button>
+				<div class="dpad-center">{routeDisplay.length}pt</div>
+				<button class="dpad-btn" onclick={() => moveJoystick(0, STEP)}>→</button>
+				<button class="dpad-btn" onclick={() => moveJoystick(0, STEP * 5)}>→→</button>
+			</div>
+			<div class="dpad-row">
+				<button class="dpad-btn" onclick={() => moveJoystick(-STEP, 0)}>↓</button>
+			</div>
+			<div class="dpad-row">
+				<button class="dpad-btn" onclick={() => moveJoystick(-STEP * 5, 0)}>↓↓</button>
+			</div>
+		</div>
+	{/if}
 
 	<!-- 停止ボタン -->
 	<button class="stop-btn" onclick={handleStop}>
@@ -1033,6 +1111,71 @@
 	.hit-btn:active { transform: scale(0.97); }
 	.hit-icon { font-size: 3rem; line-height: 1; }
 	.hit-label { font-size: 1.3rem; font-weight: 900; color: #fff; letter-spacing: 0.05em; }
+
+	/* ── ヒットフラッシュ ── */
+	.hit-flash-overlay {
+		position: fixed; inset: 0; z-index: 999;
+		background: rgba(239, 68, 68, 0.85);
+		display: flex; align-items: center; justify-content: center;
+		animation: flash-in-out 1.5s ease forwards;
+		pointer-events: none;
+	}
+	.hit-flash-text {
+		font-size: 5rem; font-weight: 900; color: #fff;
+		text-shadow: 0 0 40px rgba(255,255,255,0.8);
+		animation: flash-text 1.5s ease forwards;
+		letter-spacing: 0.1em;
+	}
+	@keyframes flash-in-out {
+		0%   { opacity: 0; }
+		15%  { opacity: 1; }
+		70%  { opacity: 1; }
+		100% { opacity: 0; }
+	}
+	@keyframes flash-text {
+		0%   { transform: scale(0.5); opacity: 0; }
+		20%  { transform: scale(1.15); opacity: 1; }
+		35%  { transform: scale(1); }
+		80%  { transform: scale(1); opacity: 1; }
+		100% { transform: scale(1.3); opacity: 0; }
+	}
+
+	/* ── テストジョイスティック ── */
+	.joystick-toggle-row {
+		display: flex; justify-content: center;
+		margin-top: 4px;
+	}
+	.joystick-toggle {
+		background: rgba(255,255,255,0.05);
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 10px; padding: 8px 18px;
+		color: #9ca3af; font-size: 0.8rem; cursor: pointer;
+		transition: all 0.15s;
+	}
+	.joystick-toggle:active { background: rgba(255,255,255,0.1); }
+
+	.dpad {
+		background: rgba(255,255,255,0.03);
+		border: 1px solid rgba(255,255,255,0.08);
+		border-radius: 16px; padding: 12px;
+		display: flex; flex-direction: column; gap: 4px; align-items: center;
+	}
+	.dpad-row { display: flex; justify-content: center; }
+	.dpad-mid { display: flex; align-items: center; gap: 4px; }
+	.dpad-btn {
+		min-width: 48px; padding: 10px 8px;
+		background: rgba(255,255,255,0.07);
+		border: 1px solid rgba(255,255,255,0.1);
+		border-radius: 10px;
+		color: #e5e5e5; font-size: 0.9rem; font-weight: 700;
+		cursor: pointer; transition: all 0.1s;
+		user-select: none; -webkit-user-select: none;
+	}
+	.dpad-btn:active { background: rgba(74,222,128,0.25); border-color: #4ade80; transform: scale(0.92); }
+	.dpad-center {
+		min-width: 48px; text-align: center;
+		font-size: 0.68rem; color: #4b5563; padding: 0 4px;
+	}
 
 	.stop-btn {
 		margin-top: 14px;
