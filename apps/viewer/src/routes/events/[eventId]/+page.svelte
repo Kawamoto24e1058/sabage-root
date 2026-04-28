@@ -48,7 +48,7 @@
 		unsubscribe = onSnapshot(q, (snap) => {
 			matches = snap.docs.map(d => ({ id: d.id, ...d.data() } as Match & { id: string }));
 			loading = false;
-		}, () => { loading = false; });
+		}, (err) => { console.error('matches snapshot error:', err); loading = false; });
 	});
 
 	onDestroy(() => { if (unsubscribe) unsubscribe(); });

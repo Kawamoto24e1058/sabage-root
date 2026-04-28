@@ -15,7 +15,7 @@
 	let fieldLayer: any;
 
 	// Match / Replay state
-	let matchId = page.params.matchId;
+	const matchId: string = page.params.matchId ?? '';
 	let match = $state<Match | null>(null);
 	let logs = $state<PlayerLog[]>([]);
 	let field = $state<Field | null>(null);
