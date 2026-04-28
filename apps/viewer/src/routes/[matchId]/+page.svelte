@@ -55,6 +55,10 @@
 	let virtualImgW = $state(1000);
 	let virtualImgH = $state(1000);
 
+	// キャリブレーション不足時のフォールバック: 各プレイヤー最初のGPS点を自動アンカーとする
+	let autoAnchorMode = false;
+	const playerAnchors = new Map<string, { aLat: number; aLng: number; aPx: number; aPy: number }>();
+
 	let unsubscribeLogs: () => void;
 	let unsubscribeMatch: () => void;
 
@@ -207,6 +211,8 @@
 			// GPS→ピクセル変換のキャリブレーションを試みる（スポーン地点が2点以上ある場合）
 			if (spawnPoints.length < 2) {
 				calibStatus = 'no-spawns';
+				// スポーンが少なくてもfieldWidthMetersがあればauto-anchorで表示可能
+				if (field?.fieldWidthMeters) autoAnchorMode = true;
 			} else if (spawnPoints.length >= 2) {
 				calibStatus = 'loading';
 				try {
@@ -256,10 +262,12 @@
 						calibStatus = 'ready';
 					} else {
 						calibStatus = 'insufficient';
+					if (field?.fieldWidthMeters) autoAnchorMode = true;
 					}
 				} catch (e) {
 					console.warn('Calibration load failed:', e);
 					calibStatus = 'insufficient';
+					if (field?.fieldWidthMeters) autoAnchorMode = true;
 				}
 			}
 		}
@@ -388,8 +396,51 @@
 	}
 
 	// ─── 座標変換ヘルパー ────────────────────────────────────────────────
-	function toMapCoords(lat: number, lng: number): [number, number] {
-		if (useVirtualMap && gpsTransform) return gpsTransform(lat, lng);
+
+	// Auto-anchor: プレイヤーの最初のGPS点を基準に相対ピクセル変換
+	// キャリブレーション不要で即座に動作する
+	function playerAutoTransform(
+		playerId: string, lat: number, lng: number, spawnId?: string
+	): [number, number] | null {
+		const fieldW = field?.fieldWidthMeters;
+		if (!fieldW) return null;
+
+		if (!playerAnchors.has(playerId)) {
+			// 最初のGPS点でアンカーを設定
+			let aPx: number, aPy: number;
+			const sp = spawnId ? spawnPointsState.find(s => s.id === spawnId) : null;
+			if (sp) {
+				// 割り当てられたスポーン位置をアンカーのピクセル位置とする
+				aPx = sp.x * virtualImgW;
+				aPy = (1 - sp.y) * virtualImgH;
+			} else {
+				// スポーン未割当ならフィールド中心
+				aPx = virtualImgW / 2;
+				aPy = virtualImgH / 2;
+			}
+			playerAnchors.set(playerId, { aLat: lat, aLng: lng, aPx, aPy });
+		}
+
+		const a = playerAnchors.get(playerId)!;
+		const pxPerM = virtualImgW / fieldW;
+		const latRad = a.aLat * Math.PI / 180;
+		const mPerDegLng = 111320 * Math.cos(latRad);
+		const mPerDegLat = 111320;
+
+		const dx = (lng - a.aLng) * mPerDegLng * pxPerM;
+		const dy = (lat - a.aLat) * mPerDegLat * pxPerM;
+
+		// Leaflet CRS.Simple: [y, x]。北=y増加なので dy は加算
+		return [a.aPy - dy, a.aPx + dx];
+	}
+
+	function toMapCoords(lat: number, lng: number, playerId?: string, spawnId?: string): [number, number] {
+		if (useVirtualMap) {
+			if (gpsTransform) return gpsTransform(lat, lng);
+			if (autoAnchorMode && playerId) {
+				return playerAutoTransform(playerId, lat, lng, spawnId) ?? [lat, lng];
+			}
+		}
 		return [lat, lng];
 	}
 
@@ -452,18 +503,18 @@
 			}
 
 			// 現在位置を決定
-			// 優先順位: GPS変換済み座標 > スポーン位置フォールバック（キャリブ不足時）
 			const pos = player.lastPosition ?? player.route[player.route.length - 1];
 			let latLng: [number, number] | null = null;
+			const spawnId = (player as any).spawnId as string | undefined;
 
-			if (pos && (!useVirtualMap || gpsTransform)) {
-				// 通常: GPS座標を変換
-				latLng = toMapCoords(pos.lat, pos.lng);
-			} else if (useVirtualMap && !gpsTransform && (player as any).spawnId) {
-				// フォールバック: キャリブレーション不足のときはスポーン位置に表示
-				const sp = spawnPointsState.find(s => s.id === (player as any).spawnId);
-				if (sp) {
-					latLng = [(1 - sp.y) * virtualImgH, sp.x * virtualImgW];
+			if (pos) {
+				if (!useVirtualMap) {
+					latLng = [pos.lat, pos.lng];
+				} else if (gpsTransform) {
+					latLng = gpsTransform(pos.lat, pos.lng);
+				} else if (autoAnchorMode && playerId) {
+					// キャリブ不要フォールバック: 最初のGPS点を自動アンカーに
+					latLng = playerAutoTransform(playerId, pos.lat, pos.lng, spawnId);
 				}
 			}
 
@@ -509,11 +560,12 @@
 				};
 			}
 
-			const mapLatLngs = visibleRoute.map(p => toMapCoords(p.lat, p.lng));
+			const spawnId = (player as any).spawnId as string | undefined;
+			const mapLatLngs = visibleRoute.map(p => toMapCoords(p.lat, p.lng, playerId, spawnId));
 			playerLayers[playerId].polyline.setLatLngs(mapLatLngs);
 
 			if (latestPoint) {
-				playerLayers[playerId].marker.setLatLng(toMapCoords(latestPoint.lat, latestPoint.lng));
+				playerLayers[playerId].marker.setLatLng(toMapCoords(latestPoint.lat, latestPoint.lng, playerId, spawnId));
 				playerLayers[playerId].marker.setOpacity(1);
 			} else {
 				playerLayers[playerId].marker.setOpacity(0);
@@ -529,7 +581,7 @@
 						iconSize: [24, 24],
 						iconAnchor: [12, 12],
 					});
-					playerLayers[playerId].hitMarker = L.marker(toMapCoords(hit.lat, hit.lng), { icon: hitIcon })
+					playerLayers[playerId].hitMarker = L.marker(toMapCoords(hit.lat, hit.lng, playerId, spawnId), { icon: hitIcon })
 						.bindTooltip(`${name} ヒット`, { direction: 'top', offset: [0, -14] })
 						.addTo(map);
 				}
