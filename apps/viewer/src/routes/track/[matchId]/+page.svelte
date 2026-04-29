@@ -40,10 +40,12 @@
 	let field = $state<Field | null>(null);
 	let spawnPoints = $state<SpawnPoint[]>([]);
 	let selectedSpawnId = $state<string | null>(null);
+	let pendingSpawn = $state<SpawnPoint | null>(null); // 選択中（まだ確定していない）
 	let spawnGpsLat = $state<number | null>(null);
 	let spawnGpsLng = $state<number | null>(null);
 	let spawnGpsAccuracy = $state<number | null>(null);
 	let spawnConfirming = $state(false);
+	let spawnRecorded = $state(false); // GPS記録完了フラグ
 	let spawnWatchId: number | null = null;
 
 	// Tracking
@@ -204,27 +206,33 @@
 		}
 	}
 
-	// スポーンマーカータップ → キャリブレーション書き込み → トラッキング開始
-	async function selectSpawn(spawn: SpawnPoint) {
-		if (!uid || spawnConfirming) return;
+	// Step1: スポーンを選択（確認画面へ遷移するだけ）
+	function chooseSpawn(spawn: SpawnPoint) {
+		pendingSpawn = spawn;
+		spawnRecorded = false;
+	}
+
+	// Step2: 「ここで記録して開始」→ GPS書き込み → トラッキング開始
+	async function confirmSpawn() {
+		if (!uid || !pendingSpawn || spawnConfirming) return;
 		spawnConfirming = true;
 
 		if (spawnGpsLat !== null && spawnGpsLng !== null) {
 			try {
 				await addDoc(collection(db, 'matches', matchId, 'calibrations'), {
-					spawnId: spawn.id,
+					spawnId: pendingSpawn.id,
 					lat: spawnGpsLat,
 					lng: spawnGpsLng,
 					uid,
 					timestamp: serverTimestamp(),
 				});
+				spawnRecorded = true;
 			} catch (e) {
 				console.warn('Calibration write failed:', e);
 			}
 		}
 
-		selectedSpawnId = spawn.id;
-		// スポーンGPS監視を停止（trackingで再開する）
+		selectedSpawnId = pendingSpawn.id;
 		if (spawnWatchId !== null) {
 			navigator.geolocation.clearWatch(spawnWatchId);
 			spawnWatchId = null;
@@ -520,100 +528,109 @@
 <!-- ══════════════════════════════════════════ -->
 {:else if screen === 'spawn'}
 <div class="screen spawn-screen">
+
+	{#if !pendingSpawn}
+	<!-- ── STEP 1: スポーン選択 ── -->
 	<div class="spawn-header">
-		<div class="spawn-title">📍 スタート位置を選択</div>
-		<div class="spawn-sub">自分がいるスポーンのマークをタップ</div>
+		<div class="spawn-title">📍 スポーンに立って選択</div>
+		<div class="spawn-sub">今いるスポーン地点を選ぶと、GPS位置が記録されてマップ上の追跡が正確になります</div>
 	</div>
 
-	<!-- GPS精度インジケーター -->
-	<div class="spawn-gps-bar">
-		{#if spawnGpsAccuracy === null}
-			<span class="gps-dot gps-waiting"></span> GPS取得中… (タップ可能)
-		{:else if spawnGpsAccuracy <= 15}
-			<span class="gps-dot gps-ok"></span> GPS精度: ±{spawnGpsAccuracy}m
-		{:else}
-			<span class="gps-dot gps-waiting"></span> GPS精度: ±{spawnGpsAccuracy}m
-		{/if}
-	</div>
-
-	<!-- フィールドマップ + スポーンマーカー（SVG） -->
+	<!-- ミニマップ（参考表示） -->
+	{#if field?.virtualBoundary && field.virtualBoundary.length >= 3}
 	<div class="spawn-map-wrap">
-		{#if field?.virtualBoundary && field.virtualBoundary.length >= 3}
-			<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="spawn-map-svg"
-				style="width:100%;height:100%;">
-				<!-- グロー効果 -->
-				<polygon
-					points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x*100},${p.y*100}`).join(' ')}
-					fill="rgba(74,222,128,0.1)"
-					stroke="rgba(74,222,128,0.15)"
-					stroke-width="2.5"
-				/>
-				<!-- 外周線 -->
-				<polygon
-					points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x*100},${p.y*100}`).join(' ')}
-					fill="none"
-					stroke="#4ade80"
-					stroke-width="0.7"
-				/>
-				<!-- スポーンマーカー -->
-				{#each spawnPoints as sp, i}
-					{@const done = selectedSpawnId === sp.id}
-					<g onclick={() => !spawnConfirming && selectSpawn(sp)} style="cursor:pointer;">
-						<!-- タップ領域を広げる透明円 -->
-						<circle cx={sp.x*100} cy={sp.y*100} r="8" fill="transparent" />
-						<!-- 外周グロー -->
-						<circle cx={sp.x*100} cy={sp.y*100} r="5.5"
-							fill="none" stroke="rgba(74,222,128,0.2)" stroke-width="2.5" />
-						<!-- メイン円 -->
-						<circle cx={sp.x*100} cy={sp.y*100} r="4.5"
-							fill={done ? '#4ade80' : 'rgba(10,10,10,0.92)'}
-							stroke="#4ade80" stroke-width="0.7" />
-						<!-- 番号 -->
-						<text x={sp.x*100} y={sp.y*100}
-							fill={done ? '#000' : '#4ade80'}
-							font-size="3.2" font-weight="bold"
-							text-anchor="middle" dominant-baseline="central"
-							pointer-events="none">{i+1}</text>
-						<!-- ラベル背景 -->
-						<rect
-							x={sp.x*100 - 9} y={sp.y*100 - 10}
-							width="18" height="4.5" rx="1"
-							fill="rgba(10,10,10,0.88)"
-							stroke="rgba(74,222,128,0.35)" stroke-width="0.3"
-						/>
-						<!-- ラベルテキスト -->
-						<text x={sp.x*100} y={sp.y*100 - 7.7}
-							fill="#e5e5e5" font-size="2.5"
-							text-anchor="middle" dominant-baseline="central"
-							pointer-events="none">{sp.label}</text>
-					</g>
-				{/each}
-			</svg>
-		{:else if field?.mapImage?.url}
-			<img src={field.mapImage.url} alt="フィールドマップ" class="spawn-map-img" />
+		<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="spawn-map-svg"
+			style="width:100%;height:100%;">
+			<polygon
+				points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x*100},${p.y*100}`).join(' ')}
+				fill="rgba(74,222,128,0.08)" stroke="#4ade80" stroke-width="0.7" />
 			{#each spawnPoints as sp, i}
-				<button
-					class="spawn-marker {selectedSpawnId === sp.id ? 'spawn-marker-done' : ''}"
-					style="left: {sp.x * 100}%; top: {sp.y * 100}%;"
-					onclick={() => selectSpawn(sp)}
-					disabled={spawnConfirming}
-				>
-					<div class="spawn-circle">{i + 1}</div>
-					<div class="spawn-label">{sp.label}</div>
-				</button>
+				<g onclick={() => chooseSpawn(sp)} style="cursor:pointer;">
+					<circle cx={sp.x*100} cy={sp.y*100} r="8" fill="transparent" />
+					<circle cx={sp.x*100} cy={sp.y*100} r="4.5"
+						fill="rgba(10,10,10,0.92)" stroke="#4ade80" stroke-width="0.7" />
+					<text x={sp.x*100} y={sp.y*100} fill="#4ade80"
+						font-size="3.2" font-weight="bold"
+						text-anchor="middle" dominant-baseline="central"
+						pointer-events="none">{i+1}</text>
+				</g>
 			{/each}
-		{:else}
-			<div class="spawn-no-map">マップデータなし</div>
-		{/if}
+		</svg>
+	</div>
+	{/if}
 
-		{#if spawnConfirming}
-			<div class="spawn-confirming">記録中…</div>
-		{/if}
+	<!-- スポーンボタンリスト（メイン操作） -->
+	<div class="spawn-btn-list">
+		{#each spawnPoints as sp, i}
+			<button class="spawn-list-btn" onclick={() => chooseSpawn(sp)}>
+				<div class="spawn-list-num">{i + 1}</div>
+				<div class="spawn-list-label">{sp.label}</div>
+				<div class="spawn-list-arrow">→</div>
+			</button>
+		{/each}
 	</div>
 
 	<button class="skip-btn" onclick={() => startTracking()}>
-		スキップ（キャリブレーションなし）
+		スキップ（スポーン選択なし）
 	</button>
+
+	{:else}
+	<!-- ── STEP 2: GPS確認 → 記録して開始 ── -->
+	<div class="spawn-confirm-screen">
+		<button class="spawn-back-btn" onclick={() => pendingSpawn = null}>← 選び直す</button>
+
+		<div class="spawn-confirm-title">
+			<div class="spawn-confirm-num">{spawnPoints.indexOf(pendingSpawn) + 1}</div>
+			<div>
+				<div class="spawn-confirm-name">{pendingSpawn.label}</div>
+				<div class="spawn-confirm-sub">このスポーン地点に立っていますか？</div>
+			</div>
+		</div>
+
+		<!-- GPS精度（大きく表示） -->
+		<div class="gps-accuracy-card">
+			{#if spawnGpsAccuracy === null}
+				<div class="gps-acc-icon gps-waiting-icon">📡</div>
+				<div class="gps-acc-label">GPS取得中…</div>
+				<div class="gps-acc-hint">屋外に出て少し待ってください</div>
+			{:else if spawnGpsAccuracy <= 10}
+				<div class="gps-acc-icon">✅</div>
+				<div class="gps-acc-value">±{spawnGpsAccuracy}m</div>
+				<div class="gps-acc-label" style="color:#4ade80">GPS良好 — 記録可能</div>
+			{:else if spawnGpsAccuracy <= 25}
+				<div class="gps-acc-icon">🟡</div>
+				<div class="gps-acc-value">±{spawnGpsAccuracy}m</div>
+				<div class="gps-acc-label" style="color:#facc15">GPS普通 — 記録可能</div>
+			{:else}
+				<div class="gps-acc-icon">⚠️</div>
+				<div class="gps-acc-value">±{spawnGpsAccuracy}m</div>
+				<div class="gps-acc-label" style="color:#f87171">GPS精度低め — 待つと改善します</div>
+			{/if}
+		</div>
+
+		<!-- 説明 -->
+		<div class="spawn-confirm-info">
+			<div class="info-row">📍 スポーン地点に正確に立つと精度が上がります</div>
+			<div class="info-row">👥 2人が別々のスポーンで記録するとマップ追跡が最も正確になります</div>
+		</div>
+
+		<!-- 記録して開始ボタン -->
+		<button
+			class="spawn-go-btn"
+			onclick={confirmSpawn}
+			disabled={spawnConfirming}
+		>
+			{#if spawnConfirming}
+				記録中…
+			{:else if spawnGpsAccuracy === null}
+				GPS未取得でもここから開始する
+			{:else}
+				✓ ここで記録して開始する
+			{/if}
+		</button>
+	</div>
+	{/if}
+
 </div>
 
 <!-- ══════════════════════════════════════════ -->
@@ -1015,6 +1032,101 @@
 		color: #4ade80;
 	}
 
+	/* ── Step2: GPS確認画面 ── */
+	.spawn-confirm-screen {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		width: 100%;
+		flex: 1;
+	}
+	.spawn-back-btn {
+		background: none;
+		border: none;
+		color: rgba(255,255,255,0.35);
+		font-size: 0.85rem;
+		cursor: pointer;
+		text-align: left;
+		padding: 0;
+	}
+	.spawn-confirm-title {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+		background: rgba(74,222,128,0.06);
+		border: 1px solid rgba(74,222,128,0.2);
+		border-radius: 16px;
+		padding: 18px 20px;
+	}
+	.spawn-confirm-num {
+		width: 44px; height: 44px;
+		border-radius: 50%;
+		background: rgba(74,222,128,0.15);
+		border: 2px solid #4ade80;
+		color: #4ade80;
+		font-size: 1.3rem; font-weight: 800;
+		display: flex; align-items: center; justify-content: center;
+		flex-shrink: 0;
+	}
+	.spawn-confirm-name {
+		font-size: 1.1rem; font-weight: 700; color: #e5e5e5;
+	}
+	.spawn-confirm-sub {
+		font-size: 0.78rem; color: rgba(255,255,255,0.4); margin-top: 3px;
+	}
+	.gps-accuracy-card {
+		background: rgba(255,255,255,0.04);
+		border: 1px solid rgba(255,255,255,0.1);
+		border-radius: 16px;
+		padding: 24px 20px;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 6px;
+		text-align: center;
+	}
+	.gps-acc-icon { font-size: 2rem; }
+	.gps-acc-value { font-size: 1.8rem; font-weight: 800; color: #e5e5e5; }
+	.gps-acc-label { font-size: 0.82rem; font-weight: 600; }
+	.gps-acc-hint { font-size: 0.75rem; color: rgba(255,255,255,0.3); margin-top: 2px; }
+	.gps-waiting-icon { animation: pulse 1.5s ease-in-out infinite; }
+	@keyframes gps-pulse { 0%,100%{opacity:1}50%{opacity:0.4} }
+
+	.spawn-confirm-info {
+		background: rgba(255,255,255,0.02);
+		border: 1px solid rgba(255,255,255,0.07);
+		border-radius: 12px;
+		padding: 14px 16px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.info-row {
+		font-size: 0.78rem;
+		color: rgba(255,255,255,0.4);
+		line-height: 1.5;
+	}
+	.spawn-go-btn {
+		background: #4ade80;
+		color: #000;
+		border: none;
+		border-radius: 16px;
+		padding: 18px;
+		font-size: 1rem;
+		font-weight: 800;
+		cursor: pointer;
+		width: 100%;
+		transition: opacity 0.15s;
+		margin-top: auto;
+	}
+	.spawn-go-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+	.spawn-go-btn:not(:disabled):hover { opacity: 0.88; }
+
+	.spawn-list-arrow {
+		color: rgba(255,255,255,0.25);
+		font-size: 1rem;
+	}
+
 	.skip-btn {
 		background: none;
 		border: 1px solid rgba(255,255,255,0.12);
@@ -1024,6 +1136,65 @@
 		font-size: 0.85rem;
 		cursor: pointer;
 		width: 100%;
+	}
+
+	/* スポーンボタンリスト */
+	.spawn-btn-list {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		width: 100%;
+		padding: 0 4px;
+	}
+	.spawn-btn-hint {
+		font-size: 0.72rem;
+		color: rgba(255,255,255,0.25);
+		text-align: center;
+		margin-bottom: 2px;
+	}
+	.spawn-list-btn {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		background: rgba(255,255,255,0.04);
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 14px;
+		padding: 14px 18px;
+		cursor: pointer;
+		transition: all 0.15s;
+		width: 100%;
+		text-align: left;
+	}
+	.spawn-list-btn:hover:not(:disabled) {
+		border-color: rgba(74,222,128,0.4);
+		background: rgba(74,222,128,0.06);
+	}
+	.spawn-list-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+	.spawn-list-btn-done {
+		border-color: #4ade80 !important;
+		background: rgba(74,222,128,0.12) !important;
+	}
+	.spawn-list-num {
+		width: 32px; height: 32px;
+		border-radius: 50%;
+		background: rgba(74,222,128,0.15);
+		border: 1.5px solid #4ade80;
+		color: #4ade80;
+		font-size: 0.9rem; font-weight: 700;
+		display: flex; align-items: center; justify-content: center;
+		flex-shrink: 0;
+	}
+	.spawn-list-label {
+		flex: 1;
+		font-size: 0.95rem; font-weight: 600;
+		color: #e5e5e5;
+	}
+	.spawn-list-gps {
+		font-size: 0.72rem;
+		color: #4ade80;
+	}
+	.spawn-list-gps.gps-loading {
+		color: rgba(255,255,255,0.25);
 	}
 
 	/* ── Tracking ── */

@@ -56,7 +56,7 @@
 	let virtualImgH = $state(1000);
 
 	// キャリブレーション不足時のフォールバック: 各プレイヤー最初のGPS点を自動アンカーとする
-	let autoAnchorMode = false;
+	let autoAnchorMode = $state(false);
 	const playerAnchors = new Map<string, { aLat: number; aLng: number; aPx: number; aPy: number }>();
 
 	let unsubscribeLogs: () => void;
@@ -518,6 +518,12 @@
 				}
 			}
 
+			// GPS未取得でもspawnIdがあればスポーン位置に静的表示
+			if (!latLng && useVirtualMap && spawnId) {
+				const sp = spawnPointsState.find(s => s.id === spawnId);
+				if (sp) latLng = [(1 - sp.y) * virtualImgH, sp.x * virtualImgW];
+			}
+
 			if (latLng) {
 				if (!playerLayers[playerId].marker) {
 					playerLayers[playerId].marker = L.marker(latLng, {
@@ -731,14 +737,14 @@
 	<div class="status-badges">
 		{#if calibStatus === 'ready'}
 			<span class="badge badge-ok">✓ GPS連動中</span>
+		{:else if (calibStatus === 'insufficient' || calibStatus === 'no-spawns') && autoAnchorMode}
+			<span class="badge badge-ok">📍 自動位置補正中</span>
 		{:else if calibStatus === 'no-spawns' && currentFieldId}
 			<a href="/fields/{currentFieldId}/edit" class="badge badge-warn">
 				📍 スポーン未設定 — タップして設定
 			</a>
 		{:else if calibStatus === 'insufficient' && currentFieldId}
-			<a href="/fields/{currentFieldId}/edit" class="badge badge-warn">
-				⚠ GPS未記録 — trackerで記録を
-			</a>
+			<span class="badge badge-warn">⚠ trackerでスポーン選択してください</span>
 		{:else if calibStatus === 'insufficient'}
 			<span class="badge badge-warn">⚠ GPS記録が不足しています</span>
 		{/if}
