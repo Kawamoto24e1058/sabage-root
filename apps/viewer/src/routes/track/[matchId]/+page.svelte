@@ -152,7 +152,30 @@
 		return `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
 	}
 
+	// ── プロフィール（localStorage永続化）──────────────────────────────────
+	const PROFILE_KEY = 'sabage-profile';
+
+	function loadProfile() {
+		try {
+			const raw = localStorage.getItem(PROFILE_KEY);
+			if (!raw) return;
+			const p = JSON.parse(raw);
+			if (p.name) playerName = p.name;
+			if (p.color && TEAM_COLORS.some(c => c.value === p.color)) selectedColor = p.color;
+		} catch (e) { /* ignore */ }
+	}
+
+	function saveProfile() {
+		try {
+			localStorage.setItem(PROFILE_KEY, JSON.stringify({
+				name: playerName.trim(),
+				color: selectedColor,
+			}));
+		} catch (e) { /* ignore */ }
+	}
+
 	onMount(async () => {
+		loadProfile();
 		try {
 			const cred = await signInAnonymously(auth);
 			uid = cred.user.uid;
@@ -254,6 +277,7 @@
 
 	async function startTracking() {
 		if (!uid) return;
+		saveProfile(); // プロフィールをlocalStorageに保存
 		screen = 'tracking';
 		routeRef = [];
 		lastRoutePoint = null;
@@ -326,6 +350,23 @@
 						});
 					} catch (e) {
 						console.warn('First position sync failed:', e);
+					}
+
+					// スポーンを選択していれば最初のGPS点でキャリブを自動記録
+					// 明示的に「到着ボタン」を押さなくても2人以上参加すれば変換が成立する
+					if (selectedSpawnId && uid) {
+						try {
+							await addDoc(collection(db, 'matches', matchId, 'calibrations'), {
+								spawnId: selectedSpawnId,
+								lat: smoothedLat,
+								lng: smoothedLng,
+								uid,
+								auto: true, // 自動記録フラグ（手動記録より重みを下げる用途に使える）
+								timestamp: serverTimestamp(),
+							});
+						} catch (e) {
+							console.warn('Auto calibration write failed:', e);
+						}
 					}
 				}
 			},
@@ -481,6 +522,9 @@
 			maxlength="20"
 			bind:value={playerName}
 		/>
+		{#if playerName}
+			<p class="profile-saved-hint">✓ 前回の設定を引き継ぎました</p>
+		{/if}
 	</div>
 
 	<div class="form-group">
@@ -766,7 +810,7 @@
 		</div>
 	</div>
 	<p class="done-note">データはPCのviewerに送信されました</p>
-	<button class="retry-btn" onclick={() => { screen = 'setup'; routeDisplay = []; elapsed = 0; isHit = false; }}>
+	<button class="retry-btn" onclick={() => { loadProfile(); screen = 'setup'; routeDisplay = []; elapsed = 0; isHit = false; deathCount = 0; selectedSpawnId = null; pendingSpawn = null; spawnRecorded = false; }}>
 		もう一度参加する
 	</button>
 </div>
@@ -835,6 +879,12 @@
 	}
 	.form-input:focus { border-color: rgba(255,255,255,0.3); }
 	.form-input::placeholder { color: rgba(255,255,255,0.2); }
+	.profile-saved-hint {
+		margin: 0;
+		font-size: 0.72rem;
+		color: rgba(74,222,128,0.6);
+		padding-left: 4px;
+	}
 
 	.team-row { display: flex; gap: 12px; }
 	.team-btn {

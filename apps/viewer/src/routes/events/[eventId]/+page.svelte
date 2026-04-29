@@ -11,6 +11,20 @@
 
 	const eventId = page.params.eventId;
 
+	// PCモード判定（localStorageから）
+	let isMobile = $state(true); // デフォルトはスマホ（SSRで safe）
+	onMount(() => {
+		const saved = localStorage.getItem('sabage-mode');
+		if (saved === 'pc') {
+			isMobile = false;
+		} else if (saved === 'mobile') {
+			isMobile = true;
+		} else {
+			// auto: pointer: coarse または幅768px未満
+			isMobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768;
+		}
+	});
+
 	let event = $state<(GameEvent & { id: string }) | null>(null);
 	let field = $state<(Field & { id: string }) | null>(null);
 	let matches = $state<(Match & { id: string })[]>([]);
@@ -121,14 +135,16 @@
 				{/if}
 			</div>
 			<div class="header-actions">
-				{#if field}
-					<a href="/fields/{event?.fieldId}/edit" class="edit-field-btn" title="フィールド設定">
-						<Settings size={15} />フィールド設定
-					</a>
+				{#if isMobile}
+					{#if field}
+						<a href="/fields/{event?.fieldId}/edit" class="edit-field-btn" title="フィールド設定">
+							<Settings size={15} />フィールド設定
+						</a>
+					{/if}
+					<button class="create-btn" onclick={() => showCreate = true}>
+						<Plus size={15} />試合を作成
+					</button>
 				{/if}
-				<button class="create-btn" onclick={() => showCreate = true}>
-					<Plus size={15} />試合を作成
-				</button>
 			</div>
 		</div>
 	</header>
@@ -158,9 +174,13 @@
 		{:else if matches.length === 0}
 			<div class="empty">
 				<p class="muted">まだ試合がありません</p>
-				<button class="cta-btn" onclick={() => showCreate = true}>
-					<Plus size={16} />最初の試合を作成する
-				</button>
+				{#if isMobile}
+					<button class="cta-btn" onclick={() => showCreate = true}>
+						<Plus size={16} />最初の試合を作成する
+					</button>
+				{:else}
+					<p class="muted" style="font-size:0.78rem">スマホから試合を作成してください</p>
+				{/if}
 			</div>
 		{:else}
 			<ul class="match-list">
@@ -186,10 +206,26 @@
 								<span class="match-date muted">{formatDate(match.createdAt)}</span>
 							</div>
 						</div>
-						<a class="view-btn" href="/{match.id}">
-							<Play size={14} fill="currentColor" />
-							{match.status === 'finished' ? 'リプレイ' : '管理'}
-						</a>
+						<div class="card-actions">
+							{#if isMobile}
+								<!-- スマホ: 参加（プレイヤートラッカーへ） -->
+								{#if match.status !== 'finished'}
+									<a class="join-btn" href="/track/{match.id}">
+										参加する →
+									</a>
+								{:else}
+									<a class="view-btn" href="/{match.id}">
+										<Play size={14} fill="currentColor" />リプレイ
+									</a>
+								{/if}
+							{:else}
+								<!-- PC: マップモニターへ -->
+								<a class="view-btn" href="/{match.id}">
+									<Play size={14} fill="currentColor" />
+									{match.status === 'finished' ? 'リプレイ' : 'モニター'}
+								</a>
+							{/if}
+						</div>
 					</li>
 				{/each}
 			</ul>
@@ -346,6 +382,7 @@
 	.match-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 	.match-label { font-size: 0.88rem; font-weight: 500; }
 	.match-date { font-size: 0.75rem; }
+	.card-actions { flex-shrink: 0; }
 	.view-btn {
 		display: flex; align-items: center; gap: 6px;
 		background: #4ade80; color: #000; text-decoration: none;
@@ -354,6 +391,15 @@
 		transition: opacity 0.15s;
 	}
 	.view-btn:hover { opacity: 0.85; }
+	.join-btn {
+		display: inline-flex; align-items: center;
+		background: rgba(74,222,128,0.12); color: #4ade80;
+		border: 1px solid rgba(74,222,128,0.35); text-decoration: none;
+		padding: 8px 18px; border-radius: 8px;
+		font-size: 0.82rem; font-weight: 700; white-space: nowrap;
+		transition: all 0.15s;
+	}
+	.join-btn:hover { background: rgba(74,222,128,0.22); border-color: rgba(74,222,128,0.6); }
 
 	/* モーダル */
 	.modal-backdrop {

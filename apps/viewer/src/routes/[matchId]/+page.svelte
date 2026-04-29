@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/state';
 	import { db } from '$lib/firebase';
-	import { collection, onSnapshot, doc, getDoc, getDocs, updateDoc } from 'firebase/firestore';
+	import { collection, onSnapshot, doc, getDoc, updateDoc } from 'firebase/firestore';
 	import type { PlayerLog, Field, Match, MatchStatus, SpawnPoint, VirtualPoint, ObstacleLine, GameMode, TeamConfig } from 'shared-types';
 	import { Play, Pause, RotateCcw, FastForward, ArrowLeft, Circle, QrCode, BarChart2, Flame } from 'lucide-svelte';
 
@@ -61,6 +61,7 @@
 
 	let unsubscribeLogs: () => void;
 	let unsubscribeMatch: () => void;
+	let unsubscribeCalib: (() => void) | null = null;
 
 	// ─── アフィン変換（2点以上のキャリブレーションから計算）───────────────
 	interface CalibPair { lat: number; lng: number; px: number; py: number; }
@@ -160,6 +161,14 @@
 			// Leaflet CRS.Simple は y軸が反転（上=imgH, 下=0）なので (1-y)*imgH に変換
 			const toL = (p: {x: number; y: number}): [number, number] => [(1 - p.y) * imgH, p.x * imgW];
 
+			// ── マップ画像を仮想座標系に合わせてオーバーレイ ──
+			if (mapImageUrl) {
+				L.imageOverlay(mapImageUrl, [[0, 0], [imgH, imgW]], {
+					opacity: 0.8,
+					interactive: false,
+				}).addTo(map);
+			}
+
 			let fitTarget: any = null;
 
 			if (vb && vb.length >= 3) {
@@ -208,67 +217,72 @@
 
 			if (fitTarget) map.fitBounds(fitTarget, { padding: [50, 50] });
 
-			// GPS→ピクセル変換のキャリブレーションを試みる（スポーン地点が2点以上ある場合）
+			// ── キャリブレーションをリアルタイム購読 ──────────────────────────
+			// 参加者がスポーンを選んでGPSが取得されるたびに変換を自動更新する
 			if (spawnPoints.length < 2) {
 				calibStatus = 'no-spawns';
-				// スポーンが少なくてもfieldWidthMetersがあればauto-anchorで表示可能
 				if (field?.fieldWidthMeters) autoAnchorMode = true;
-			} else if (spawnPoints.length >= 2) {
+			} else {
 				calibStatus = 'loading';
-				try {
-					const calibSnap = await getDocs(collection(db, 'matches', matchId, 'calibrations'));
-					const calibDocs = calibSnap.docs.map(d => d.data() as { spawnId: string; lat: number; lng: number });
+				unsubscribeCalib = onSnapshot(
+					collection(db, 'matches', matchId, 'calibrations'),
+					(calibSnap) => {
+						const calibDocs = calibSnap.docs.map(d => d.data() as { spawnId: string; lat: number; lng: number });
 
-					const spawnGPS: Record<string, { lats: number[]; lngs: number[] }> = {};
-					calibDocs.forEach(c => {
-						if (!spawnGPS[c.spawnId]) spawnGPS[c.spawnId] = { lats: [], lngs: [] };
-						spawnGPS[c.spawnId].lats.push(c.lat);
-						spawnGPS[c.spawnId].lngs.push(c.lng);
-					});
-
-					const calibPairs: CalibPair[] = spawnPoints
-						.filter(sp => spawnGPS[sp.id]?.lats.length > 0)
-						.map(sp => {
-							const lats = spawnGPS[sp.id].lats;
-							const lngs = spawnGPS[sp.id].lngs;
-							return {
-								lat: lats.reduce((a, b) => a + b, 0) / lats.length,
-								lng: lngs.reduce((a, b) => a + b, 0) / lngs.length,
-								px: sp.x * imgW,
-								py: (1 - sp.y) * imgH, // Leaflet y軸反転補正
-							};
+						// スポーンごとにGPS座標を集約（複数人が同じスポーンを記録した場合は平均）
+						const spawnGPS: Record<string, { lats: number[]; lngs: number[] }> = {};
+						calibDocs.forEach(c => {
+							if (!spawnGPS[c.spawnId]) spawnGPS[c.spawnId] = { lats: [], lngs: [] };
+							spawnGPS[c.spawnId].lats.push(c.lat);
+							spawnGPS[c.spawnId].lngs.push(c.lng);
 						});
 
-					if (calibPairs.length >= 2) {
-						// 2点以上: フル変換（回転・スケール・平行移動）
-						gpsTransform = buildGpsTransform(calibPairs);
-						calibStatus = 'ready';
-					} else if (calibPairs.length === 1 && field?.fieldWidthMeters) {
-						// 1点 + フィールド幅: スポーンを原点とした相対変換
-						const p = calibPairs[0];
-						// pixels/degree: imgWピクセル = fieldWidthMeters(m) ÷ cos補正
-						const latRad = p.lat * Math.PI / 180;
-						const metersPerDegLng = 111320 * Math.cos(latRad);
-						const metersPerDegLat = 111320;
-						const pxPerM = imgW / field.fieldWidthMeters;
-						const pxPerDegLng = pxPerM * metersPerDegLng;
-						const pxPerDegLat = pxPerM * metersPerDegLat;
-						gpsTransform = (lat: number, lng: number): [number, number] => {
-							const dpx = (lng - p.lng) * pxPerDegLng;
-							const dpy = (lat - p.lat) * pxPerDegLat;
-							// Leaflet CRS.Simple: y軸上方向 = py増加 → lat増加
-							return [p.py + dpy, p.px + dpx];
-						};
-						calibStatus = 'ready';
-					} else {
+						const calibPairs: CalibPair[] = spawnPoints
+							.filter(sp => spawnGPS[sp.id]?.lats.length > 0)
+							.map(sp => {
+								const lats = spawnGPS[sp.id].lats;
+								const lngs = spawnGPS[sp.id].lngs;
+								return {
+									lat: lats.reduce((a, b) => a + b, 0) / lats.length,
+									lng: lngs.reduce((a, b) => a + b, 0) / lngs.length,
+									px: sp.x * imgW,
+									py: (1 - sp.y) * imgH,
+								};
+							});
+
+						if (calibPairs.length >= 2) {
+							// 2点以上: フル変換（回転・スケール・平行移動）→ 最も正確
+							gpsTransform = buildGpsTransform(calibPairs);
+							autoAnchorMode = false;
+							calibStatus = 'ready';
+							// auto-anchorのキャッシュをクリア（変換が刷新されたため）
+							playerAnchors.clear();
+						} else if (calibPairs.length === 1 && field?.fieldWidthMeters) {
+							// 1点 + フィールド幅: スポーン基準の相対変換
+							const p = calibPairs[0];
+							const latRad = p.lat * Math.PI / 180;
+							const pxPerM = imgW / field.fieldWidthMeters;
+							const pxPerDegLng = pxPerM * 111320 * Math.cos(latRad);
+							const pxPerDegLat = pxPerM * 111320;
+							gpsTransform = (lat: number, lng: number): [number, number] => {
+								return [p.py + (lat - p.lat) * pxPerDegLat, p.px + (lng - p.lng) * pxPerDegLng];
+							};
+							autoAnchorMode = false;
+							calibStatus = 'ready';
+							playerAnchors.clear();
+						} else {
+							// データ不足: auto-anchorにフォールバック
+							gpsTransform = null;
+							if (field?.fieldWidthMeters) autoAnchorMode = true;
+							calibStatus = calibPairs.length === 0 ? 'insufficient' : 'loading';
+						}
+					},
+					(e) => {
+						console.warn('Calibration snapshot error:', e);
 						calibStatus = 'insufficient';
-					if (field?.fieldWidthMeters) autoAnchorMode = true;
+						if (field?.fieldWidthMeters) autoAnchorMode = true;
 					}
-				} catch (e) {
-					console.warn('Calibration load failed:', e);
-					calibStatus = 'insufficient';
-					if (field?.fieldWidthMeters) autoAnchorMode = true;
-				}
+				);
 			}
 		}
 
@@ -343,6 +357,7 @@
 	onDestroy(() => {
 		if (unsubscribeLogs) unsubscribeLogs();
 		if (unsubscribeMatch) unsubscribeMatch();
+		if (unsubscribeCalib) unsubscribeCalib();
 		stopPlayback();
 	});
 
@@ -754,6 +769,25 @@
 		{/if}
 	</div>
 
+	<!-- ── 生存者オーバーレイ（試合中 / Live のみ） ── -->
+	{#if match?.status === 'playing' && viewMode === 'live' && logs.length > 0}
+		{@const teamIds = [...new Set(logs.map(p => p.team ?? 'A'))].sort()}
+		<div class="alive-overlay">
+			{#each teamIds as team}
+				{@const teamLogs = logs.filter(p => (p.team ?? 'A') === team)}
+				{@const alive = teamLogs.filter(p => !p.hitEvent).length}
+				{@const total = teamLogs.length}
+				{@const teamName = match?.teams?.find(t => t.id === team)?.name ?? `チーム${team}`}
+				{@const repColor = teamLogs[0]?.teamColor ?? '#aaa'}
+				<div class="alive-team">
+					<span class="alive-dot" style="background:{repColor}"></span>
+					<span class="alive-name">{teamName}</span>
+					<span class="alive-count" style="color:{repColor}">{alive}<span class="alive-total">/{total}</span></span>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
 	<!-- 待機中：参加者募集 + 試合設定パネル -->
 	{#if match?.status === 'waiting' && !joinPanelDismissed}
 		<div class="join-panel">
@@ -901,18 +935,19 @@
 	<div class="bottom-bar">
 		<!-- 上段：凡例（プレイヤーがいる時だけ） -->
 		{#if logs.length > 0}
+			{@const teamIds = [...new Set(logs.map(p => p.team ?? 'A'))].sort()}
 			<div class="legend-row">
-				{#each ['A','B'] as team}
-					{#if logs.some(p => (p.team ?? 'A') === team)}
-						<span class="team-label">チーム{team}</span>
-						{#each logs.filter(p => (p.team ?? 'A') === team) as player}
-							<div class="legend-item">
-								<span class="legend-dot" style="background: {player.teamColor || '#ff0000'}"></span>
-								<span class="legend-name">{player.name || player.id}</span>
-								{#if player.hitEvent}<span class="hit-badge">💀</span>{/if}
-							</div>
-						{/each}
-					{/if}
+				{#each teamIds as team}
+					{@const teamLogs = logs.filter(p => (p.team ?? 'A') === team)}
+					{@const teamName = match?.teams?.find(t => t.id === team)?.name ?? `チーム${team}`}
+					<span class="team-label">{teamName}</span>
+					{#each teamLogs as player}
+						<div class="legend-item">
+							<span class="legend-dot" style="background: {player.teamColor || '#ff0000'}; opacity:{player.hitEvent ? 0.35 : 1}"></span>
+							<span class="legend-name" style="opacity:{player.hitEvent ? 0.4 : 1}">{player.name || player.id}</span>
+							{#if player.hitEvent}<span class="hit-badge">💀</span>{/if}
+						</div>
+					{/each}
 				{/each}
 			</div>
 		{/if}
@@ -1022,6 +1057,50 @@
 		font-size: 0.78rem;
 		font-weight: 600;
 		text-align: center;
+	}
+
+	/* ── 生存者オーバーレイ ── */
+	.alive-overlay {
+		position: absolute;
+		top: 12px;
+		left: 12px;
+		z-index: 500;
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		pointer-events: none;
+	}
+	.alive-team {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: rgba(10,10,10,0.82);
+		backdrop-filter: blur(12px);
+		border: 1px solid rgba(255,255,255,0.1);
+		border-radius: 12px;
+		padding: 8px 14px;
+		min-width: 120px;
+	}
+	.alive-dot {
+		width: 10px; height: 10px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+	.alive-name {
+		flex: 1;
+		font-size: 0.78rem;
+		font-weight: 600;
+		color: rgba(255,255,255,0.7);
+	}
+	.alive-count {
+		font-size: 1.1rem;
+		font-weight: 800;
+		font-variant-numeric: tabular-nums;
+	}
+	.alive-total {
+		font-size: 0.7rem;
+		opacity: 0.45;
+		font-weight: 600;
 	}
 
 	/* ── 待機中参加パネル ── */
