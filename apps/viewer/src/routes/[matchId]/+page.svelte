@@ -49,7 +49,9 @@
 	let calibStatus = $state<'none' | 'no-spawns' | 'loading' | 'ready' | 'insufficient'>('none');
 	let currentFieldId = $state('');
 	// GPS(lat,lng) → Leaflet CRS.Simple の [y,x] ピクセル座標
+	// plain変数だが gpsTransformVersion ($state) をセットで更新して $effect に変更を伝える
 	let gpsTransform: ((lat: number, lng: number) => [number, number]) | null = null;
+	let gpsTransformVersion = $state(0); // gpsTransform が変わるたびインクリメント
 	// スポーン地点（フォールバック表示用）
 	let spawnPointsState = $state<SpawnPoint[]>([]);
 	let virtualImgW = $state(1000);
@@ -253,9 +255,9 @@
 						if (calibPairs.length >= 2) {
 							// 2点以上: フル変換（回転・スケール・平行移動）→ 最も正確
 							gpsTransform = buildGpsTransform(calibPairs);
+							gpsTransformVersion++;
 							autoAnchorMode = false;
 							calibStatus = 'ready';
-							// auto-anchorのキャッシュをクリア（変換が刷新されたため）
 							playerAnchors.clear();
 						} else if (calibPairs.length === 1 && field?.fieldWidthMeters) {
 							// 1点 + フィールド幅: スポーン基準の相対変換
@@ -267,6 +269,7 @@
 							gpsTransform = (lat: number, lng: number): [number, number] => {
 								return [p.py + (lat - p.lat) * pxPerDegLat, p.px + (lng - p.lng) * pxPerDegLng];
 							};
+							gpsTransformVersion++;
 							autoAnchorMode = false;
 							calibStatus = 'ready';
 							playerAnchors.clear();
@@ -499,6 +502,9 @@
 	// ─── Liveモード描画 $effect ──────────────────────────────────────────
 	$effect(() => {
 		if (!L || !map || viewMode !== 'live') return;
+		// gpsTransform / calibStatus が変わったら必ず再実行させる
+		void gpsTransformVersion;
+		void calibStatus;
 
 		logs.forEach(player => {
 			const playerId = player.id;
@@ -768,6 +774,29 @@
 			<span class="badge badge-warn">⚠ 境界線未登録</span>
 		{/if}
 	</div>
+
+	<!-- ── デバッグパネル（何も映らないときの診断用） ── -->
+	{#if logs.length === 0 && match?.status !== 'waiting'}
+		<div class="debug-panel">
+			<div class="debug-title">📡 プレイヤー未接続</div>
+			<div class="debug-row">スマホで <code>/track/{matchId}</code> を開いてください</div>
+			<div class="debug-row muted">virtualMap: {useVirtualMap} | calib: {calibStatus}</div>
+		</div>
+	{:else if logs.length > 0}
+		<div class="debug-panel">
+			<div class="debug-title">👥 {logs.length}人接続中</div>
+			{#each logs as p}
+				<div class="debug-row">
+					<span class="debug-dot" style="background:{p.teamColor}"></span>
+					<span>{p.name || p.id?.slice(0,6)}</span>
+					<span class="muted">
+						{p.lastPosition ? '📍GPS' : (p as any).spawnId ? '🏁スポーン待機' : '⌛GPS待機'}
+					</span>
+				</div>
+			{/each}
+			<div class="debug-row muted" style="margin-top:4px">calib: {calibStatus} | anchor: {autoAnchorMode}</div>
+		</div>
+	{/if}
 
 	<!-- ── 生存者オーバーレイ（試合中 / Live のみ） ── -->
 	{#if match?.status === 'playing' && viewMode === 'live' && logs.length > 0}
@@ -1058,6 +1087,50 @@
 		font-weight: 600;
 		text-align: center;
 	}
+
+	/* ── デバッグパネル ── */
+	.debug-panel {
+		position: absolute;
+		top: 50px;
+		right: 12px;
+		z-index: 500;
+		background: rgba(10,10,10,0.88);
+		backdrop-filter: blur(12px);
+		border: 1px solid rgba(255,255,255,0.1);
+		border-radius: 12px;
+		padding: 10px 14px;
+		min-width: 180px;
+		max-width: 260px;
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
+		pointer-events: none;
+	}
+	.debug-title {
+		font-size: 0.75rem;
+		font-weight: 700;
+		color: rgba(255,255,255,0.6);
+		margin-bottom: 2px;
+	}
+	.debug-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 0.7rem;
+		color: rgba(255,255,255,0.75);
+	}
+	.debug-dot {
+		width: 8px; height: 8px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+	.debug-row code {
+		font-size: 0.65rem;
+		background: rgba(255,255,255,0.1);
+		padding: 1px 5px;
+		border-radius: 4px;
+	}
+	.debug-row.muted, .muted { color: rgba(255,255,255,0.3); font-size: 0.65rem; }
 
 	/* ── 生存者オーバーレイ ── */
 	.alive-overlay {
