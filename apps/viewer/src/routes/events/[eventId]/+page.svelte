@@ -7,7 +7,7 @@
 		doc, getDoc, collection, query, where, orderBy, onSnapshot, addDoc
 	} from 'firebase/firestore';
 	import type { GameEvent, Field, Match, TeamConfig, GameMode } from 'shared-types';
-	import { ArrowLeft, Play, Clock, CheckCircle, Plus, Settings, MapPin } from 'lucide-svelte';
+	import { ArrowLeft, Play, Clock, CheckCircle, Plus, Settings, MapPin, QrCode } from 'lucide-svelte';
 
 	const eventId = page.params.eventId ?? '';
 
@@ -23,6 +23,7 @@
 			// auto: pointer: coarse または幅768px未満
 			isMobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768;
 		}
+		origin = window.location.origin;
 	});
 
 	let event = $state<(GameEvent & { id: string }) | null>(null);
@@ -34,6 +35,10 @@
 	// 試合作成モーダル
 	let showCreate = $state(false);
 	let creating = $state(false);
+
+	// フィールド設定QRモーダル
+	let showFieldQR = $state(false);
+	let origin = $state('');
 
 	// ゲーム設定
 	let gameMode = $state<GameMode>('elimination');
@@ -136,9 +141,15 @@
 			</div>
 			<div class="header-actions">
 				{#if field}
-					<a href="/fields/{event?.fieldId}/edit" class="edit-field-btn" title="フィールド設定">
-						<Settings size={15} />フィールド設定
-					</a>
+					{#if isMobile}
+						<a href="/fields/{event?.fieldId}/edit" class="edit-field-btn" title="フィールド設定">
+							<Settings size={15} />フィールド設定
+						</a>
+					{:else}
+						<button class="edit-field-btn" onclick={() => showFieldQR = true} title="フィールド設定（QR）">
+							<QrCode size={15} />フィールド設定
+						</button>
+					{/if}
 				{/if}
 				<button class="create-btn" onclick={() => showCreate = true}>
 					<Plus size={15} />試合を作成
@@ -156,10 +167,18 @@
 				{#if field.spawnPoints && field.spawnPoints.length > 0}
 					<span class="tag">スポーン {field.spawnPoints.length}点</span>
 				{:else}
-					<a href="/fields/{event?.fieldId}/edit" class="tag warn">スポーン未設定</a>
+					{#if isMobile}
+						<a href="/fields/{event?.fieldId}/edit" class="tag warn">スポーン未設定 →</a>
+					{:else}
+						<button class="tag warn tag-btn" onclick={() => showFieldQR = true}>⚠ スポーン未設定 — QRで設定</button>
+					{/if}
 				{/if}
 				{#if field.boundary && field.boundary.length >= 3}
 					<span class="tag">外周 {field.boundary.length}点</span>
+				{:else}
+					{#if !isMobile}
+						<button class="tag warn tag-btn" onclick={() => showFieldQR = true}>⚠ 外周未設定 — QRで設定</button>
+					{/if}
 				{/if}
 			</div>
 		{/if}
@@ -223,6 +242,28 @@
 		{/if}
 	</main>
 </div>
+
+<!-- フィールド設定QRモーダル -->
+{#if showFieldQR}
+	<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+	<div class="modal-backdrop" onclick={() => showFieldQR = false}>
+		<div class="modal fqr-modal" onclick={(e) => e.stopPropagation()}>
+			<h2>📱 フィールド設定 — スマホで開く</h2>
+			<p class="fqr-sub">スマホのカメラでQRをスキャンしてGPS設定ページを開いてください</p>
+			{#if origin && event?.fieldId}
+				<img
+					src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4ade80&bgcolor=141414&data={encodeURIComponent(`${origin}/fields/${event.fieldId}/edit`)}"
+					alt="Field Edit QR"
+					class="fqr-img"
+				/>
+				<div class="fqr-url">/fields/{event.fieldId}/edit</div>
+			{/if}
+			<div class="modal-actions">
+				<button class="cancel-btn" onclick={() => showFieldQR = false}>閉じる</button>
+			</div>
+		</div>
+	</div>
+{/if}
 
 <!-- 試合作成モーダル -->
 {#if showCreate}
@@ -460,4 +501,24 @@
 	}
 	.confirm-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 	.confirm-btn:not(:disabled):hover { opacity: 0.85; }
+
+	/* フィールドQRモーダル */
+	.fqr-modal { align-items: center; text-align: center; max-width: 320px; }
+	.fqr-sub { font-size: 0.78rem; color: rgba(255,255,255,0.35); margin: 0; line-height: 1.5; }
+	.fqr-img { width: 200px; height: 200px; border-radius: 12px; border: 1px solid rgba(74,222,128,0.25); }
+	.fqr-url {
+		font-size: 0.65rem; font-family: monospace;
+		color: rgba(74,222,128,0.5);
+		background: rgba(74,222,128,0.05); border: 1px solid rgba(74,222,128,0.12);
+		border-radius: 6px; padding: 6px 10px; word-break: break-all;
+	}
+
+	/* タグボタン（警告タグをボタン化） */
+	.tag-btn {
+		cursor: pointer; background: rgba(250,204,21,0.08);
+		border: 1px solid rgba(250,204,21,0.25); color: #facc15;
+		font-size: 0.72rem; border-radius: 20px; padding: 2px 8px;
+		transition: all 0.15s;
+	}
+	.tag-btn:hover { background: rgba(250,204,21,0.15); border-color: rgba(250,204,21,0.5); }
 </style>
