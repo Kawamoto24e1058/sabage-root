@@ -135,16 +135,14 @@
 				{/if}
 			</div>
 			<div class="header-actions">
-				{#if isMobile}
-					{#if field}
-						<a href="/fields/{event?.fieldId}/edit" class="edit-field-btn" title="フィールド設定">
-							<Settings size={15} />フィールド設定
-						</a>
-					{/if}
-					<button class="create-btn" onclick={() => showCreate = true}>
-						<Plus size={15} />試合を作成
-					</button>
+				{#if field}
+					<a href="/fields/{event?.fieldId}/edit" class="edit-field-btn" title="フィールド設定">
+						<Settings size={15} />フィールド設定
+					</a>
 				{/if}
+				<button class="create-btn" onclick={() => showCreate = true}>
+					<Plus size={15} />試合を作成
+				</button>
 			</div>
 		</div>
 	</header>
@@ -171,13 +169,9 @@
 		{:else if matches.length === 0}
 			<div class="empty">
 				<p class="muted">まだ試合がありません</p>
-				{#if isMobile}
-					<button class="cta-btn" onclick={() => showCreate = true}>
-						<Plus size={16} />最初の試合を作成する
-					</button>
-				{:else}
-					<p class="muted" style="font-size:0.78rem">スマホから試合を作成してください</p>
-				{/if}
+				<button class="cta-btn" onclick={() => showCreate = true}>
+					<Plus size={16} />最初の試合を作成する
+				</button>
 			</div>
 		{:else}
 			<ul class="match-list">

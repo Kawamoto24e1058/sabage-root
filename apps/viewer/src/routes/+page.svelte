@@ -154,13 +154,22 @@
 			<Monitor size={14} />モニターモード — 試合を選んでマップを表示
 		</div>
 
+		<div class="section-header">
+			<span class="section-label">イベント</span>
+			<a href="/events/new" class="create-btn">
+				<PlusCircle size={14} />作成
+			</a>
+		</div>
+
 		{#if loading}
 			<div class="empty"><p class="muted">読み込み中...</p></div>
 		{:else if events.length === 0}
 			<div class="empty">
 				<div class="empty-icon">📺</div>
 				<p class="empty-title">表示できるイベントがありません</p>
-				<p class="muted">スマホモードでイベントを作成してください。</p>
+				<a href="/events/new" class="empty-cta">
+					<PlusCircle size={16} />最初のイベントを作成する
+				</a>
 			</div>
 		{:else}
 			<ul class="event-list">
