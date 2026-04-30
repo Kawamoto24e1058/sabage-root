@@ -9,7 +9,7 @@
 	import type { GameEvent, Field, Match, TeamConfig, GameMode } from 'shared-types';
 	import { ArrowLeft, Play, Clock, CheckCircle, Plus, Settings, MapPin } from 'lucide-svelte';
 
-	const eventId = page.params.eventId;
+	const eventId = page.params.eventId ?? '';
 
 	// PCモード判定（localStorageから）
 	let isMobile = $state(true); // デフォルトはスマホ（SSRで safe）
@@ -155,16 +155,13 @@
 			<div class="field-info-bar">
 				<MapPin size={13} />
 				<span>{field.name}</span>
-				{#if field.mapImage?.url}
-					<span class="tag">仮想マップあり</span>
-				{/if}
 				{#if field.spawnPoints && field.spawnPoints.length > 0}
 					<span class="tag">スポーン {field.spawnPoints.length}点</span>
 				{:else}
 					<a href="/fields/{event?.fieldId}/edit" class="tag warn">スポーン未設定</a>
 				{/if}
-				{#if field.fieldWidthMeters}
-					<span class="tag">横幅 {field.fieldWidthMeters}m</span>
+				{#if field.boundary && field.boundary.length >= 3}
+					<span class="tag">外周 {field.boundary.length}点</span>
 				{/if}
 			</div>
 		{/if}

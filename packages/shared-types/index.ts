@@ -7,48 +7,19 @@ export interface RoutePoint extends GeoPoint {
   timestamp: number; // Unix timestamp
 }
 
-export interface MapImage {
-  url: string;
-}
-
-// 画像上の正規化座標点（左上=0,0 / 右下=1,1）
-export interface VirtualPoint {
-  x: number;
-  y: number;
-}
-
-// AI検出された障害物（線分）
-export interface ObstacleLine {
-  points: VirtualPoint[];
-}
-
-// フィールド画像上のスポーン地点（正規化座標 0-1）
+// フィールド画像上のスポーン地点（GPS座標）
 export interface SpawnPoint {
   id: string;     // 'spawn-a', 'spawn-b' など
   label: string;  // 'チームAスポーン' など
-  x: number;      // 画像左端=0, 右端=1
-  y: number;      // 画像上端=0, 下端=1
-}
-
-// 当日プレイヤーがスポーンで記録したGPS（Firestoreサブコレクション）
-export interface CalibrationPoint {
-  id?: string;
-  spawnId: string;   // SpawnPoint.id に対応
   lat: number;
   lng: number;
-  recordedAt: number;
-  playerUid: string;
 }
 
 export interface Field {
   id?: string; // Firestore document ID
   name: string;
-  boundary: GeoPoint[];
-  mapImage?: MapImage;
+  boundary: GeoPoint[];      // フィールド外周（GPS座標列）
   spawnPoints?: SpawnPoint[];
-  virtualBoundary?: VirtualPoint[];
-  obstacles?: ObstacleLine[];
-  fieldWidthMeters?: number; // フィールドの実際の横幅(m) — 1点キャリブレーション用
 }
 
 // サバゲーイベント（1日の開催単位）

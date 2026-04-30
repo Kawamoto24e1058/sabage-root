@@ -3,10 +3,10 @@
 	import { page } from '$app/state';
 	import { db, auth } from '$lib/firebase';
 	import { signInAnonymously } from 'firebase/auth';
-	import { doc, setDoc, updateDoc, serverTimestamp, getDoc, collection, addDoc } from 'firebase/firestore';
+	import { doc, setDoc, updateDoc, serverTimestamp, getDoc } from 'firebase/firestore';
 	import type { RoutePoint, Field, SpawnPoint, GameMode, TeamConfig } from 'shared-types';
 
-	const matchId = page.params.matchId;
+	const matchId = page.params.matchId ?? '';
 
 	const TEAM_COLORS = [
 		{ label: 'レッド',   value: '#ef4444' },
@@ -40,13 +40,9 @@
 	let field = $state<Field | null>(null);
 	let spawnPoints = $state<SpawnPoint[]>([]);
 	let selectedSpawnId = $state<string | null>(null);
-	let pendingSpawn = $state<SpawnPoint | null>(null); // 選択中（まだ確定していない）
-	let spawnGpsLat = $state<number | null>(null);
-	let spawnGpsLng = $state<number | null>(null);
-	let spawnGpsAccuracy = $state<number | null>(null);
-	let spawnConfirming = $state(false);
-	let spawnRecorded = $state(false); // GPS記録完了フラグ
 	let spawnWatchId: number | null = null;
+	// スポーンまでの距離（GPS座標ベースで計算）
+	let spawnDistances = $state<Record<string, number>>({});
 
 	// Tracking
 	let routeDisplay = $state<RoutePoint[]>([]);
@@ -87,7 +83,7 @@
 		routeDisplay = routeRef;
 		gpsStatus = 'ok';
 		// 即時Firestore同期
-		const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+		const logRef = doc(db, 'matches', matchId, 'player_logs', uid!);
 		try {
 			const { updateDoc: upd, serverTimestamp: sts } = await import('firebase/firestore');
 			await upd(logRef, { route: routeRef, lastPosition: newPoint, updatedAt: sts() });
@@ -214,53 +210,32 @@
 
 		if (spawnPoints.length > 0) {
 			screen = 'spawn';
-			// GPS先読み開始（スポーンに到着してからタップするとき精度が出やすい）
+			// GPS取得してスポーンまでの距離を計算
 			spawnWatchId = navigator.geolocation.watchPosition(
 				(pos) => {
-					spawnGpsLat = pos.coords.latitude;
-					spawnGpsLng = pos.coords.longitude;
-					spawnGpsAccuracy = Math.round(pos.coords.accuracy);
+					const lat = pos.coords.latitude;
+					const lng = pos.coords.longitude;
+					const distances: Record<string, number> = {};
+					spawnPoints.forEach(sp => {
+						distances[sp.id] = Math.round(haversineM(lat, lng, sp.lat, sp.lng));
+					});
+					spawnDistances = distances;
 				},
 				() => {},
-				{ enableHighAccuracy: true, maximumAge: 0 }
+				{ enableHighAccuracy: true, maximumAge: 2000 }
 			);
 		} else {
 			startTracking();
 		}
 	}
 
-	// Step1: スポーンを選択（確認画面へ遷移するだけ）
+	// スポーンを選択して追跡開始
 	function chooseSpawn(spawn: SpawnPoint) {
-		pendingSpawn = spawn;
-		spawnRecorded = false;
-	}
-
-	// Step2: 「ここで記録して開始」→ GPS書き込み → トラッキング開始
-	async function confirmSpawn() {
-		if (!uid || !pendingSpawn || spawnConfirming) return;
-		spawnConfirming = true;
-
-		if (spawnGpsLat !== null && spawnGpsLng !== null) {
-			try {
-				await addDoc(collection(db, 'matches', matchId, 'calibrations'), {
-					spawnId: pendingSpawn.id,
-					lat: spawnGpsLat,
-					lng: spawnGpsLng,
-					uid,
-					timestamp: serverTimestamp(),
-				});
-				spawnRecorded = true;
-			} catch (e) {
-				console.warn('Calibration write failed:', e);
-			}
-		}
-
-		selectedSpawnId = pendingSpawn.id;
+		selectedSpawnId = spawn.id;
 		if (spawnWatchId !== null) {
 			navigator.geolocation.clearWatch(spawnWatchId);
 			spawnWatchId = null;
 		}
-		spawnConfirming = false;
 		startTracking();
 	}
 
@@ -289,7 +264,7 @@
 		await requestWakeLock();
 
 		// Firestoreドキュメント初期化
-		const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+		const logRef = doc(db, 'matches', matchId, 'player_logs', uid!);
 		try {
 			await setDoc(logRef, {
 				name: playerName.trim() || `Player_${uid.slice(0, 4).toUpperCase()}`,
@@ -352,23 +327,7 @@
 						console.warn('First position sync failed:', e);
 					}
 
-					// スポーンを選択していれば最初のGPS点でキャリブを自動記録
-					// 明示的に「到着ボタン」を押さなくても2人以上参加すれば変換が成立する
-					if (selectedSpawnId && uid) {
-						try {
-							await addDoc(collection(db, 'matches', matchId, 'calibrations'), {
-								spawnId: selectedSpawnId,
-								lat: smoothedLat,
-								lng: smoothedLng,
-								uid,
-								auto: true, // 自動記録フラグ（手動記録より重みを下げる用途に使える）
-								timestamp: serverTimestamp(),
-							});
-						} catch (e) {
-							console.warn('Auto calibration write failed:', e);
-						}
 					}
-				}
 			},
 			(err) => {
 				gpsStatus = 'error';
@@ -400,7 +359,7 @@
 		if (!uid) return;
 		cleanup();
 
-		const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+		const logRef = doc(db, 'matches', matchId, 'player_logs', uid!);
 		const lastPoint = routeRef[routeRef.length - 1];
 		const hitEvent = hitPosition
 			? { lat: hitPosition.lat, lng: hitPosition.lng, timestamp: Date.now() }
@@ -445,7 +404,7 @@
 			// 復活あり: ヒットを記録しつつ tracking 継続 or 待機
 			deathCount++;
 			if (hitPos && uid) {
-				const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+				const logRef = doc(db, 'matches', matchId, 'player_logs', uid!);
 				try {
 					const { arrayUnion } = await import('firebase/firestore');
 					await updateDoc(logRef, {
@@ -477,7 +436,7 @@
 		if (respawnTimer) { clearInterval(respawnTimer); respawnTimer = null; }
 		// 復活: hitEvent をクリアして追跡再開
 		if (uid) {
-			const logRef = doc(db, 'matches', matchId, 'player_logs', uid);
+			const logRef = doc(db, 'matches', matchId, 'player_logs', uid!);
 			try {
 				await updateDoc(logRef, { hitEvent: null });
 			} catch(e) { console.warn(e); }
@@ -572,43 +531,24 @@
 <!-- ══════════════════════════════════════════ -->
 {:else if screen === 'spawn'}
 <div class="screen spawn-screen">
-
-	{#if !pendingSpawn}
-	<!-- ── STEP 1: スポーン選択 ── -->
 	<div class="spawn-header">
-		<div class="spawn-title">📍 スポーンに立って選択</div>
-		<div class="spawn-sub">今いるスポーン地点を選ぶと、GPS位置が記録されてマップ上の追跡が正確になります</div>
+		<div class="spawn-title">📍 スポーンを選択</div>
+		<div class="spawn-sub">今いるスポーン地点を選んでください</div>
 	</div>
 
-	<!-- ミニマップ（参考表示） -->
-	{#if field?.virtualBoundary && field.virtualBoundary.length >= 3}
-	<div class="spawn-map-wrap">
-		<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="spawn-map-svg"
-			style="width:100%;height:100%;">
-			<polygon
-				points={field.virtualBoundary.map((p: {x:number;y:number}) => `${p.x*100},${p.y*100}`).join(' ')}
-				fill="rgba(74,222,128,0.08)" stroke="#4ade80" stroke-width="0.7" />
-			{#each spawnPoints as sp, i}
-				<g onclick={() => chooseSpawn(sp)} style="cursor:pointer;">
-					<circle cx={sp.x*100} cy={sp.y*100} r="8" fill="transparent" />
-					<circle cx={sp.x*100} cy={sp.y*100} r="4.5"
-						fill="rgba(10,10,10,0.92)" stroke="#4ade80" stroke-width="0.7" />
-					<text x={sp.x*100} y={sp.y*100} fill="#4ade80"
-						font-size="3.2" font-weight="bold"
-						text-anchor="middle" dominant-baseline="central"
-						pointer-events="none">{i+1}</text>
-				</g>
-			{/each}
-		</svg>
-	</div>
-	{/if}
-
-	<!-- スポーンボタンリスト（メイン操作） -->
+	<!-- スポーンボタンリスト（GPS距離順） -->
 	<div class="spawn-btn-list">
-		{#each spawnPoints as sp, i}
+		{#each [...spawnPoints].sort((a, b) => {
+			const da = spawnDistances[a.id] ?? Infinity;
+			const db = spawnDistances[b.id] ?? Infinity;
+			return da - db;
+		}) as sp, i}
 			<button class="spawn-list-btn" onclick={() => chooseSpawn(sp)}>
 				<div class="spawn-list-num">{i + 1}</div>
 				<div class="spawn-list-label">{sp.label}</div>
+				{#if spawnDistances[sp.id] !== undefined}
+					<div class="spawn-list-dist">{spawnDistances[sp.id]}m</div>
+				{/if}
 				<div class="spawn-list-arrow">→</div>
 			</button>
 		{/each}
@@ -617,64 +557,6 @@
 	<button class="skip-btn" onclick={() => startTracking()}>
 		スキップ（スポーン選択なし）
 	</button>
-
-	{:else}
-	<!-- ── STEP 2: GPS確認 → 記録して開始 ── -->
-	<div class="spawn-confirm-screen">
-		<button class="spawn-back-btn" onclick={() => pendingSpawn = null}>← 選び直す</button>
-
-		<div class="spawn-confirm-title">
-			<div class="spawn-confirm-num">{spawnPoints.indexOf(pendingSpawn) + 1}</div>
-			<div>
-				<div class="spawn-confirm-name">{pendingSpawn.label}</div>
-				<div class="spawn-confirm-sub">このスポーン地点に立っていますか？</div>
-			</div>
-		</div>
-
-		<!-- GPS精度（大きく表示） -->
-		<div class="gps-accuracy-card">
-			{#if spawnGpsAccuracy === null}
-				<div class="gps-acc-icon gps-waiting-icon">📡</div>
-				<div class="gps-acc-label">GPS取得中…</div>
-				<div class="gps-acc-hint">屋外に出て少し待ってください</div>
-			{:else if spawnGpsAccuracy <= 10}
-				<div class="gps-acc-icon">✅</div>
-				<div class="gps-acc-value">±{spawnGpsAccuracy}m</div>
-				<div class="gps-acc-label" style="color:#4ade80">GPS良好 — 記録可能</div>
-			{:else if spawnGpsAccuracy <= 25}
-				<div class="gps-acc-icon">🟡</div>
-				<div class="gps-acc-value">±{spawnGpsAccuracy}m</div>
-				<div class="gps-acc-label" style="color:#facc15">GPS普通 — 記録可能</div>
-			{:else}
-				<div class="gps-acc-icon">⚠️</div>
-				<div class="gps-acc-value">±{spawnGpsAccuracy}m</div>
-				<div class="gps-acc-label" style="color:#f87171">GPS精度低め — 待つと改善します</div>
-			{/if}
-		</div>
-
-		<!-- 説明 -->
-		<div class="spawn-confirm-info">
-			<div class="info-row">📍 スポーン地点に正確に立つと精度が上がります</div>
-			<div class="info-row">👥 2人が別々のスポーンで記録するとマップ追跡が最も正確になります</div>
-		</div>
-
-		<!-- 記録して開始ボタン -->
-		<button
-			class="spawn-go-btn"
-			onclick={confirmSpawn}
-			disabled={spawnConfirming}
-		>
-			{#if spawnConfirming}
-				記録中…
-			{:else if spawnGpsAccuracy === null}
-				GPS未取得でもここから開始する
-			{:else}
-				✓ ここで記録して開始する
-			{/if}
-		</button>
-	</div>
-	{/if}
-
 </div>
 
 <!-- ══════════════════════════════════════════ -->
@@ -810,7 +692,7 @@
 		</div>
 	</div>
 	<p class="done-note">データはPCのviewerに送信されました</p>
-	<button class="retry-btn" onclick={() => { loadProfile(); screen = 'setup'; routeDisplay = []; elapsed = 0; isHit = false; deathCount = 0; selectedSpawnId = null; pendingSpawn = null; spawnRecorded = false; }}>
+	<button class="retry-btn" onclick={() => { loadProfile(); screen = 'setup'; routeDisplay = []; elapsed = 0; isHit = false; deathCount = 0; selectedSpawnId = null; spawnDistances = {}; }}>
 		もう一度参加する
 	</button>
 </div>
@@ -1172,9 +1054,17 @@
 	.spawn-go-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 	.spawn-go-btn:not(:disabled):hover { opacity: 0.88; }
 
+	.spawn-list-dist {
+		font-size: 0.72rem;
+		color: rgba(74,222,128,0.55);
+		font-family: monospace;
+		font-weight: 600;
+		margin-left: auto;
+	}
 	.spawn-list-arrow {
 		color: rgba(255,255,255,0.25);
 		font-size: 1rem;
+		flex-shrink: 0;
 	}
 
 	.skip-btn {

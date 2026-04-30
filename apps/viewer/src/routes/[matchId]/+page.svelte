@@ -3,16 +3,16 @@
 	import { page } from '$app/state';
 	import { db } from '$lib/firebase';
 	import { collection, onSnapshot, doc, getDoc, updateDoc } from 'firebase/firestore';
-	import type { PlayerLog, Field, Match, MatchStatus, SpawnPoint, VirtualPoint, ObstacleLine, GameMode, TeamConfig } from 'shared-types';
-	import { Play, Pause, RotateCcw, FastForward, ArrowLeft, Circle, QrCode, BarChart2, Flame } from 'lucide-svelte';
+	import type { PlayerLog, Field, Match, MatchStatus, GameMode, TeamConfig } from 'shared-types';
+	import { Play, Pause, RotateCcw, ArrowLeft, Circle, QrCode, BarChart2, Flame, Radar } from 'lucide-svelte';
 
-	// Leaflet types
+	// Leaflet
 	let L: any;
 	let map: any;
 	let mapElement: HTMLElement;
 	let playerLayers: Record<string, { polyline: any; marker: any; hitMarker: any | null }> = {};
 	let heatLayer: any = null;
-	let fieldLayer: any;
+	let fieldPolygon: any = null;
 
 	// Match / Replay state
 	const matchId: string = page.params.matchId ?? '';
@@ -31,89 +31,23 @@
 	// Live / Replay モード
 	let viewMode = $state<'live' | 'replay'>('live');
 
+	// レーダースキャンライン（デフォルト無効）
+	let showScanLine = $state(false);
+
 	// モーダル
 	let showQR = $state(false);
 	let showStats = $state(false);
 	let showHeatmap = $state(false);
 	let joinPanelDismissed = $state(false);
 
-	// 待機中は参加パネルを表示（dismissするまで）
 	$effect(() => {
 		if (match?.status === 'waiting' && !joinPanelDismissed) {
-			showQR = false; // QRモーダルは使わない（パネルで代替）
+			showQR = false;
 		}
 	});
 
-	// 仮想マップ
-	let useVirtualMap = $state(false);
-	let calibStatus = $state<'none' | 'no-spawns' | 'loading' | 'ready' | 'insufficient'>('none');
-	let currentFieldId = $state('');
-	// GPS(lat,lng) → Leaflet CRS.Simple の [y,x] ピクセル座標
-	// plain変数だが gpsTransformVersion ($state) をセットで更新して $effect に変更を伝える
-	let gpsTransform: ((lat: number, lng: number) => [number, number]) | null = null;
-	let gpsTransformVersion = $state(0); // gpsTransform が変わるたびインクリメント
-	// スポーン地点（フォールバック表示用）
-	let spawnPointsState = $state<SpawnPoint[]>([]);
-	let virtualImgW = $state(1000);
-	let virtualImgH = $state(1000);
-
-	// キャリブレーション不足時のフォールバック: 各プレイヤー最初のGPS点を自動アンカーとする
-	let autoAnchorMode = $state(false);
-	const playerAnchors = new Map<string, { aLat: number; aLng: number; aPx: number; aPy: number }>();
-
 	let unsubscribeLogs: () => void;
 	let unsubscribeMatch: () => void;
-	let unsubscribeCalib: (() => void) | null = null;
-
-	// ─── アフィン変換（2点以上のキャリブレーションから計算）───────────────
-	interface CalibPair { lat: number; lng: number; px: number; py: number; }
-
-	function buildGpsTransform(pairs: CalibPair[]): ((lat: number, lng: number) => [number, number]) | null {
-		if (pairs.length < 2) return null;
-
-		// 最も離れた2点ペアを選ぶ（精度最大化）
-		let best = { i: 0, j: 1, dist: 0 };
-		for (let i = 0; i < pairs.length; i++) {
-			for (let j = i + 1; j < pairs.length; j++) {
-				const dlat = pairs[j].lat - pairs[i].lat;
-				const dlng = pairs[j].lng - pairs[i].lng;
-				const d = dlat * dlat + dlng * dlng;
-				if (d > best.dist) best = { i, j, dist: d };
-			}
-		}
-
-		const p1 = pairs[best.i];
-		const p2 = pairs[best.j];
-		const dlat = p2.lat - p1.lat;
-		const dlng = p2.lng - p1.lng;
-		const dpx  = p2.px  - p1.px;
-		const dpy  = p2.py  - p1.py;
-
-		const denom = dlat * dlat + dlng * dlng;
-		if (denom === 0) return null;
-
-		// 相似変換: 回転 + スケール + 平行移動
-		const a = (dpx * dlat + dpy * dlng) / denom;
-		const b = (dpy * dlat - dpx * dlng) / denom;
-
-		return (lat: number, lng: number): [number, number] => {
-			const dl = lat - p1.lat;
-			const dn = lng - p1.lng;
-			const px = a * dl - b * dn + p1.px;
-			const py = b * dl + a * dn + p1.py;
-			return [py, px]; // Leaflet CRS.Simple: [lat=y, lng=x]
-		};
-	}
-
-	// ─── 画像サイズをロード ──────────────────────────────────────────────
-	function loadImageSize(url: string): Promise<{ w: number; h: number }> {
-		return new Promise((resolve, reject) => {
-			const img = new Image();
-			img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
-			img.onerror = reject;
-			img.src = url;
-		});
-	}
 
 	onMount(async () => {
 		const leaflet = await import('leaflet');
@@ -126,210 +60,90 @@
 		match = { id: matchDoc.id, ...matchDoc.data() } as Match;
 
 		const fieldId = match.fieldId;
-		currentFieldId = fieldId ?? '';
-		let spawnPoints: SpawnPoint[] = [];
-		let mapImageUrl = '';
 
 		if (fieldId) {
 			const fieldDoc = await getDoc(doc(db, 'fields', fieldId));
 			if (fieldDoc.exists()) {
-				field = fieldDoc.data() as Field;
-				spawnPoints = field.spawnPoints ?? [];
-				spawnPointsState = spawnPoints; // $effect から参照できるよう保存
-				mapImageUrl = field.mapImage?.url ?? '';
+				field = { id: fieldDoc.id, ...fieldDoc.data() } as Field;
 			}
 		}
 
-		// ② virtualBoundary または mapImage があれば仮想マップモード（CRS.Simple）を使う
-		const vb = field?.virtualBoundary;
-		const hasVirtualMap = (vb && vb.length >= 3) || mapImageUrl;
+		// ② MGSレーダーマップ初期化（タイル無し・暗い背景）
+		map = L.map(mapElement, {
+			zoomControl: false,
+			dragging: false,
+			scrollWheelZoom: false,
+			doubleClickZoom: false,
+			boxZoom: false,
+			touchZoom: false,
+			keyboard: false,
+			attributionControl: false,
+		});
 
-		if (hasVirtualMap) {
-			// 座標系は virtualBoundary または mapImage のサイズから決める
-			let imgW = 1000, imgH = 1000;
-			if (mapImageUrl) {
-				const size = await loadImageSize(mapImageUrl);
-				imgW = size.w; imgH = size.h;
-			} else if (vb && vb.length >= 3) {
-				// virtualBoundary の正規化座標から仮の解像度を使う
-				imgW = 1000; imgH = 1000;
-			}
-			useVirtualMap = true;
-			virtualImgW = imgW;
-			virtualImgH = imgH;
+		// フィールド外周ポリゴン
+		if (field?.boundary && field.boundary.length >= 3) {
+			const latLngs = field.boundary.map(p => [p.lat, p.lng] as [number, number]);
 
-			map = L.map(mapElement, { crs: L.CRS.Simple, minZoom: -5, maxZoom: 5, attributionControl: false });
-
-			// Leaflet CRS.Simple は y軸が反転（上=imgH, 下=0）なので (1-y)*imgH に変換
-			const toL = (p: {x: number; y: number}): [number, number] => [(1 - p.y) * imgH, p.x * imgW];
-
-			// ── マップ画像を仮想座標系に合わせてオーバーレイ ──
-			if (mapImageUrl) {
-				L.imageOverlay(mapImageUrl, [[0, 0], [imgH, imgW]], {
-					opacity: 0.8,
-					interactive: false,
-				}).addTo(map);
-			}
-
-			let fitTarget: any = null;
-
-			if (vb && vb.length >= 3) {
-				// フィールド外周：実線・塗りつぶし
-				const poly = L.polygon(vb.map(toL), {
-					color: '#4ade80',
-					weight: 3,
-					fillColor: '#4ade80',
-					fillOpacity: 0.12,
-				}).addTo(map);
-				fitTarget = poly.getBounds();
-
-				// 外周の外側に薄いグロー効果
-				L.polygon(vb.map(toL), {
-					color: '#4ade80',
-					weight: 8,
-					opacity: 0.08,
-					fillOpacity: 0,
-					interactive: false,
-				}).addTo(map);
-			} else {
-				fitTarget = [[0, 0], [imgH, imgW]];
-			}
-
-			// 障害物は非表示（マップをシンプルに保つ）
-
-			// スポーン地点マーカー
-			spawnPoints.forEach((sp, i) => {
-				const icon = L.divIcon({
-					html: `<div style="
-						width:30px;height:30px;border-radius:50%;
-						background:rgba(10,10,10,0.9);
-						border:2.5px solid #4ade80;
-						color:#4ade80;font-size:13px;font-weight:700;
-						display:flex;align-items:center;justify-content:center;
-						box-shadow:0 0 0 4px rgba(74,222,128,0.15), 0 3px 10px rgba(0,0,0,0.7);
-					">${i + 1}</div>`,
-					iconSize: [30, 30], iconAnchor: [15, 15], className: '',
-				});
-				const m = L.marker(toL(sp), { icon }).addTo(map);
-				m.bindTooltip(sp.label, {
-					permanent: true, direction: 'top', offset: [0, -18],
-					className: 'spawn-label-tip',
-				});
-			});
-
-			if (fitTarget) map.fitBounds(fitTarget, { padding: [50, 50] });
-
-			// ── キャリブレーションをリアルタイム購読 ──────────────────────────
-			// 参加者がスポーンを選んでGPSが取得されるたびに変換を自動更新する
-			if (spawnPoints.length < 2) {
-				calibStatus = 'no-spawns';
-				if (field?.fieldWidthMeters) autoAnchorMode = true;
-			} else {
-				calibStatus = 'loading';
-				unsubscribeCalib = onSnapshot(
-					collection(db, 'matches', matchId, 'calibrations'),
-					(calibSnap) => {
-						const calibDocs = calibSnap.docs.map(d => d.data() as { spawnId: string; lat: number; lng: number });
-
-						// スポーンごとにGPS座標を集約（複数人が同じスポーンを記録した場合は平均）
-						const spawnGPS: Record<string, { lats: number[]; lngs: number[] }> = {};
-						calibDocs.forEach(c => {
-							if (!spawnGPS[c.spawnId]) spawnGPS[c.spawnId] = { lats: [], lngs: [] };
-							spawnGPS[c.spawnId].lats.push(c.lat);
-							spawnGPS[c.spawnId].lngs.push(c.lng);
-						});
-
-						const calibPairs: CalibPair[] = spawnPoints
-							.filter(sp => spawnGPS[sp.id]?.lats.length > 0)
-							.map(sp => {
-								const lats = spawnGPS[sp.id].lats;
-								const lngs = spawnGPS[sp.id].lngs;
-								return {
-									lat: lats.reduce((a, b) => a + b, 0) / lats.length,
-									lng: lngs.reduce((a, b) => a + b, 0) / lngs.length,
-									px: sp.x * imgW,
-									py: (1 - sp.y) * imgH,
-								};
-							});
-
-						if (calibPairs.length >= 2) {
-							// 2点以上: フル変換（回転・スケール・平行移動）→ 最も正確
-							gpsTransform = buildGpsTransform(calibPairs);
-							gpsTransformVersion++;
-							autoAnchorMode = false;
-							calibStatus = 'ready';
-							playerAnchors.clear();
-						} else if (calibPairs.length === 1 && field?.fieldWidthMeters) {
-							// 1点 + フィールド幅: スポーン基準の相対変換
-							const p = calibPairs[0];
-							const latRad = p.lat * Math.PI / 180;
-							const pxPerM = imgW / field.fieldWidthMeters;
-							const pxPerDegLng = pxPerM * 111320 * Math.cos(latRad);
-							const pxPerDegLat = pxPerM * 111320;
-							gpsTransform = (lat: number, lng: number): [number, number] => {
-								return [p.py + (lat - p.lat) * pxPerDegLat, p.px + (lng - p.lng) * pxPerDegLng];
-							};
-							gpsTransformVersion++;
-							autoAnchorMode = false;
-							calibStatus = 'ready';
-							playerAnchors.clear();
-						} else {
-							// データ不足: auto-anchorにフォールバック
-							gpsTransform = null;
-							if (field?.fieldWidthMeters) autoAnchorMode = true;
-							calibStatus = calibPairs.length === 0 ? 'insufficient' : 'loading';
-						}
-					},
-					(e) => {
-						console.warn('Calibration snapshot error:', e);
-						calibStatus = 'insufficient';
-						if (field?.fieldWidthMeters) autoAnchorMode = true;
-					}
-				);
-			}
-		}
-
-		// キャリブレーション不足 or 仮想マップ不可 → 通常リアルマップ
-		if (!useVirtualMap) {
-			map = L.map(mapElement).setView([35.6812, 139.7671], 15);
-			L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-				attribution: '&copy; OpenStreetMap &copy; CARTO'
+			// 外側グロー（太い半透明）
+			L.polygon(latLngs, {
+				color: '#4ade80',
+				weight: 14,
+				opacity: 0.06,
+				fillOpacity: 0,
+				interactive: false,
 			}).addTo(map);
 
-			if (field?.boundary && field.boundary.length >= 3) {
-				const latLngs = field.boundary.map(p => [p.lat, p.lng] as [number, number]);
-				fieldLayer = L.polygon(latLngs, {
-					color: '#4ade80',
-					fillColor: '#4ade80',
-					fillOpacity: 0.1,
-					weight: 2,
-					dashArray: '5, 5'
-				}).addTo(map);
-				map.fitBounds(fieldLayer.getBounds());
-			} else {
-				noBoundary = true;
-			}
+			// 中グロー
+			L.polygon(latLngs, {
+				color: '#4ade80',
+				weight: 6,
+				opacity: 0.2,
+				fillOpacity: 0,
+				interactive: false,
+			}).addTo(map);
 
-			if (mapImageUrl && field?.mapImage) {
-				// フォールバック: 境界線に基づくオーバーレイ（旧方式）
-				if (field.boundary && field.boundary.length >= 2) {
-					const lats = field.boundary.map(p => p.lat);
-					const lngs = field.boundary.map(p => p.lng);
-					const imgBounds: [[number, number], [number, number]] = [
-						[Math.min(...lats), Math.min(...lngs)],
-						[Math.max(...lats), Math.max(...lngs)],
-					];
-					L.imageOverlay(mapImageUrl, imgBounds, { opacity: 0.6 }).addTo(map);
-					if (!fieldLayer) map.fitBounds(imgBounds, { padding: [40, 40] });
-				}
-			}
+			// メインライン + 塗りつぶし
+			fieldPolygon = L.polygon(latLngs, {
+				color: '#4ade80',
+				weight: 2,
+				opacity: 0.9,
+				fillColor: '#0d1f0d',
+				fillOpacity: 0.55,
+				interactive: false,
+			}).addTo(map);
+
+			map.fitBounds(fieldPolygon.getBounds(), { padding: [60, 60] });
+		} else {
+			noBoundary = true;
+			map.setView([35.6812, 139.7671], 16);
 		}
+
+		// スポーン地点マーカー（GPS座標から直接描画）
+		const spawnPoints = field?.spawnPoints ?? [];
+		spawnPoints.forEach((sp, i) => {
+			const icon = L.divIcon({
+				html: `<div style="
+					width:28px;height:28px;border-radius:50%;
+					background:rgba(5,10,5,0.92);
+					border:2px solid #4ade80;
+					color:#4ade80;font-size:11px;font-weight:800;
+					display:flex;align-items:center;justify-content:center;
+					box-shadow:0 0 0 4px rgba(74,222,128,0.1), 0 0 12px rgba(74,222,128,0.3);
+					font-family:monospace;
+				">${i + 1}</div>`,
+				iconSize: [28, 28], iconAnchor: [14, 14], className: '',
+			});
+			const m = L.marker([sp.lat, sp.lng], { icon }).addTo(map);
+			m.bindTooltip(sp.label, {
+				permanent: true, direction: 'top', offset: [0, -18],
+				className: 'spawn-label-tip',
+			});
+		});
 
 		// ③ match リアルタイム購読
 		unsubscribeMatch = onSnapshot(doc(db, 'matches', matchId), (snap) => {
 			if (snap.exists()) {
 				match = { id: snap.id, ...snap.data() } as Match;
-				// 試合終了ならReplayモードへ自動切替
 				if (match.status === 'finished' && viewMode === 'live') {
 					viewMode = 'replay';
 					currentTime = startTime;
@@ -348,10 +162,10 @@
 				endTime = Math.max(...allTimestamps);
 				if (currentTime === 0) currentTime = startTime;
 
-				// 実マップモードのみ: GPSで範囲フィット
-				if (!useVirtualMap && map) {
+				// 境界線がない場合は全プレイヤーGPS範囲にフィット
+				if (noBoundary) {
 					const allPoints = logs.flatMap(l => l.route.map(p => [p.lat, p.lng] as [number, number]));
-					if (allPoints.length > 0) map.fitBounds(L.latLngBounds(allPoints));
+					if (allPoints.length > 0) map.fitBounds(L.latLngBounds(allPoints), { padding: [60, 60] });
 				}
 			}
 		});
@@ -360,7 +174,6 @@
 	onDestroy(() => {
 		if (unsubscribeLogs) unsubscribeLogs();
 		if (unsubscribeMatch) unsubscribeMatch();
-		if (unsubscribeCalib) unsubscribeCalib();
 		stopPlayback();
 	});
 
@@ -392,7 +205,6 @@
 			showHeatmap = false;
 			return;
 		}
-		// Leaflet.heat をCDNから動的ロード
 		if (!(window as any).L?.heatLayer) {
 			await new Promise<void>((resolve, reject) => {
 				const s = document.createElement('script');
@@ -402,94 +214,47 @@
 				document.head.appendChild(s);
 			});
 		}
-		const points = logs.flatMap(p => p.route.map(r => {
-			if (useVirtualMap && gpsTransform) {
-				const [py, px] = gpsTransform(r.lat, r.lng);
-				return [py, px, 1.0] as [number, number, number];
-			}
-			return [r.lat, r.lng, 1.0] as [number, number, number];
-		}));
+		const points = logs.flatMap(p => p.route.map(r => [r.lat, r.lng, 1.0] as [number, number, number]));
 		heatLayer = (L as any).heatLayer(points, { radius: 22, blur: 15, maxZoom: 17 }).addTo(map);
 		showHeatmap = true;
 	}
 
-	// ─── 座標変換ヘルパー ────────────────────────────────────────────────
-
-	// Auto-anchor: プレイヤーの最初のGPS点を基準に相対ピクセル変換
-	// キャリブレーション不要で即座に動作する
-	function playerAutoTransform(
-		playerId: string, lat: number, lng: number, spawnId?: string
-	): [number, number] | null {
-		const fieldW = field?.fieldWidthMeters;
-		if (!fieldW) return null;
-
-		if (!playerAnchors.has(playerId)) {
-			// 最初のGPS点でアンカーを設定
-			let aPx: number, aPy: number;
-			const sp = spawnId ? spawnPointsState.find(s => s.id === spawnId) : null;
-			if (sp) {
-				// 割り当てられたスポーン位置をアンカーのピクセル位置とする
-				aPx = sp.x * virtualImgW;
-				aPy = (1 - sp.y) * virtualImgH;
-			} else {
-				// スポーン未割当ならフィールド中心
-				aPx = virtualImgW / 2;
-				aPy = virtualImgH / 2;
-			}
-			playerAnchors.set(playerId, { aLat: lat, aLng: lng, aPx, aPy });
-		}
-
-		const a = playerAnchors.get(playerId)!;
-		const pxPerM = virtualImgW / fieldW;
-		const latRad = a.aLat * Math.PI / 180;
-		const mPerDegLng = 111320 * Math.cos(latRad);
-		const mPerDegLat = 111320;
-
-		const dx = (lng - a.aLng) * mPerDegLng * pxPerM;
-		const dy = (lat - a.aLat) * mPerDegLat * pxPerM;
-
-		// Leaflet CRS.Simple: [y, x]。北=y増加なので dy は加算
-		return [a.aPy - dy, a.aPx + dx];
-	}
-
-	function toMapCoords(lat: number, lng: number, playerId?: string, spawnId?: string): [number, number] {
-		if (useVirtualMap) {
-			if (gpsTransform) return gpsTransform(lat, lng);
-			if (autoAnchorMode && playerId) {
-				return playerAutoTransform(playerId, lat, lng, spawnId) ?? [lat, lng];
-			}
-		}
-		return [lat, lng];
-	}
-
-	// プレイヤーマーカーDivIcon（名前ラベル付き）
+	// ─── MGS スタイル プレイヤーアイコン ─────────────────────────────────
 	function makePlayerIcon(color: string, name: string, isHit = false) {
+		const size = isHit ? 8 : 11;
+		const glow = isHit ? '' : `0 0 6px ${color}, 0 0 14px ${color}66`;
+		const opacity = isHit ? 0.35 : 1;
 		return L.divIcon({
 			html: `
-				<div style="position:relative;display:flex;flex-direction:column;align-items:center;gap:3px;">
+				<div style="position:relative;display:flex;flex-direction:column;align-items:center;pointer-events:none;">
 					<div style="
-						background:rgba(10,10,10,0.9);
-						border:2.5px solid ${color};
-						border-radius:50%;
-						width:${isHit ? 20 : 24}px;height:${isHit ? 20 : 24}px;
-						opacity:${isHit ? 0.45 : 1};
-					"></div>
-					<div style="
-						background:rgba(10,10,10,0.82);
-						border:1px solid ${color}88;
-						color:${color};
-						font-size:10px;font-weight:700;
-						padding:1px 6px;border-radius:4px;
+						position:absolute;
+						bottom:${size + 4}px;
+						left:50%;
+						transform:translateX(-50%);
 						white-space:nowrap;
+						font-size:9px;
+						font-family:monospace;
+						font-weight:700;
+						color:${color};
+						text-shadow:0 0 5px ${color}99;
+						letter-spacing:0.06em;
+						opacity:${opacity};
 					">${name}</div>
+					<div style="
+						width:${size}px;height:${size}px;
+						border-radius:50%;
+						background:${color};
+						box-shadow:${glow};
+						opacity:${opacity};
+					"></div>
 				</div>`,
 			className: '',
-			iconSize: [60, 44],
-			iconAnchor: [30, 12],
+			iconSize: [size, size],
+			iconAnchor: [size / 2, size / 2],
 		});
 	}
 
-	// レイヤーをすべてクリア（モード切替時）
 	function clearPlayerLayers() {
 		Object.values(playerLayers).forEach(l => {
 			l.polyline?.remove();
@@ -502,59 +267,33 @@
 	// ─── Liveモード描画 $effect ──────────────────────────────────────────
 	$effect(() => {
 		if (!L || !map || viewMode !== 'live') return;
-		// gpsTransform / calibStatus が変わったら必ず再実行させる
-		void gpsTransformVersion;
-		void calibStatus;
 
 		logs.forEach(player => {
 			const playerId = player.id;
 			if (!playerId) return;
 
-			const color = player.teamColor || '#ff0000';
-			const name = player.name || playerId;
+			const color = player.teamColor || '#4ade80';
+			const name = player.name || playerId.slice(0, 6);
 			const isHit = !!player.hitEvent;
 
-			// Liveモードはマーカーのみ（軌跡はリプレイで見る）
 			if (!playerLayers[playerId]) {
-				playerLayers[playerId] = {
-					polyline: null,   // Liveでは使わない
-					marker: null,     // 位置が来てから追加
-					hitMarker: null
-				};
+				playerLayers[playerId] = { polyline: null, marker: null, hitMarker: null };
 			}
 
-			// 現在位置を決定
+			// 最新位置
 			const pos = player.lastPosition ?? player.route[player.route.length - 1];
-			let latLng: [number, number] | null = null;
-			const spawnId = (player as any).spawnId as string | undefined;
+			if (!pos) return;
 
-			if (pos) {
-				if (!useVirtualMap) {
-					latLng = [pos.lat, pos.lng];
-				} else if (gpsTransform) {
-					latLng = gpsTransform(pos.lat, pos.lng);
-				} else if (autoAnchorMode && playerId) {
-					// キャリブ不要フォールバック: 最初のGPS点を自動アンカーに
-					latLng = playerAutoTransform(playerId, pos.lat, pos.lng, spawnId);
-				}
-			}
+			const latLng: [number, number] = [pos.lat, pos.lng];
 
-			// GPS未取得でもspawnIdがあればスポーン位置に静的表示
-			if (!latLng && useVirtualMap && spawnId) {
-				const sp = spawnPointsState.find(s => s.id === spawnId);
-				if (sp) latLng = [(1 - sp.y) * virtualImgH, sp.x * virtualImgW];
-			}
-
-			if (latLng) {
-				if (!playerLayers[playerId].marker) {
-					playerLayers[playerId].marker = L.marker(latLng, {
-						icon: makePlayerIcon(color, name, isHit),
-						zIndexOffset: 100,
-					}).addTo(map);
-				} else {
-					playerLayers[playerId].marker.setLatLng(latLng);
-					playerLayers[playerId].marker.setIcon(makePlayerIcon(color, name, isHit));
-				}
+			if (!playerLayers[playerId].marker) {
+				playerLayers[playerId].marker = L.marker(latLng, {
+					icon: makePlayerIcon(color, name, isHit),
+					zIndexOffset: 100,
+				}).addTo(map);
+			} else {
+				playerLayers[playerId].marker.setLatLng(latLng);
+				playerLayers[playerId].marker.setIcon(makePlayerIcon(color, name, isHit));
 			}
 		});
 	});
@@ -567,8 +306,8 @@
 			const playerId = player.id;
 			if (!playerId) return;
 
-			const color = player.teamColor || '#ff0000';
-			const name = player.name || playerId;
+			const color = player.teamColor || '#4ade80';
+			const name = player.name || playerId.slice(0, 6);
 			const visibleRoute = player.route.filter(p => p.timestamp <= currentTime);
 			const latestPoint = visibleRoute[visibleRoute.length - 1];
 
@@ -576,23 +315,22 @@
 				playerLayers[playerId] = {
 					polyline: L.polyline([], {
 						color,
-						weight: 3,
-						opacity: 0.7
+						weight: 2,
+						opacity: 0.6,
 					}).addTo(map),
 					marker: L.marker([0, 0], {
 						icon: makePlayerIcon(color, name),
 						zIndexOffset: 100,
 					}).addTo(map),
-					hitMarker: null
+					hitMarker: null,
 				};
 			}
 
-			const spawnId = (player as any).spawnId as string | undefined;
-			const mapLatLngs = visibleRoute.map(p => toMapCoords(p.lat, p.lng, playerId, spawnId));
+			const mapLatLngs = visibleRoute.map(p => [p.lat, p.lng] as [number, number]);
 			playerLayers[playerId].polyline.setLatLngs(mapLatLngs);
 
 			if (latestPoint) {
-				playerLayers[playerId].marker.setLatLng(toMapCoords(latestPoint.lat, latestPoint.lng, playerId, spawnId));
+				playerLayers[playerId].marker.setLatLng([latestPoint.lat, latestPoint.lng]);
 				playerLayers[playerId].marker.setOpacity(1);
 			} else {
 				playerLayers[playerId].marker.setOpacity(0);
@@ -603,13 +341,13 @@
 			if (hit && currentTime >= hit.timestamp) {
 				if (!playerLayers[playerId].hitMarker) {
 					const hitIcon = L.divIcon({
-						html: `<div style="font-size:20px;line-height:1;text-shadow:0 0 4px rgba(0,0,0,0.8)">💀</div>`,
+						html: `<div style="font-size:16px;line-height:1;filter:drop-shadow(0 0 3px rgba(255,0,0,0.6))">💀</div>`,
 						className: '',
-						iconSize: [24, 24],
-						iconAnchor: [12, 12],
+						iconSize: [20, 20],
+						iconAnchor: [10, 10],
 					});
-					playerLayers[playerId].hitMarker = L.marker(toMapCoords(hit.lat, hit.lng, playerId, spawnId), { icon: hitIcon })
-						.bindTooltip(`${name} ヒット`, { direction: 'top', offset: [0, -14] })
+					playerLayers[playerId].hitMarker = L.marker([hit.lat, hit.lng], { icon: hitIcon })
+						.bindTooltip(`${name} ヒット`, { direction: 'top', offset: [0, -12] })
 						.addTo(map);
 				}
 			} else if (playerLayers[playerId].hitMarker) {
@@ -619,9 +357,9 @@
 		});
 	});
 
-	// モード切替時にレイヤーをリセット
+	// モード切替時にレイヤーリセット
 	$effect(() => {
-		void viewMode; // 依存として登録
+		void viewMode;
 		if (L && map) clearPlayerLayers();
 	});
 
@@ -631,19 +369,16 @@
 		playing:  'finished',
 		finished: null
 	};
-
 	const STATUS_LABEL: Record<MatchStatus, string> = {
 		waiting:  '待機中',
 		playing:  '試合中',
 		finished: '終了'
 	};
-
 	const STATUS_COLOR: Record<MatchStatus, string> = {
 		waiting:  '#facc15',
 		playing:  '#4ade80',
 		finished: '#6b7280'
 	};
-
 	const STATUS_BTN_LABEL: Record<MatchStatus, string> = {
 		waiting:  '試合開始',
 		playing:  '試合終了',
@@ -651,21 +386,13 @@
 	};
 
 	// ─── 試合設定 ────────────────────────────────────────────────────────
-	const GAME_MODE_LABELS: Record<GameMode, string> = {
-		elimination:       '殲滅戦（死んだら終わり）',
-		unlimited_respawn: '無制限復活',
-		timed_respawn:     '制限時間復活',
-	};
-
 	const DEFAULT_TEAM_NAMES = ['チームA','チームB','チームC','チームD'];
-
 	let settingMode = $state<GameMode>('elimination');
 	let settingTeamCount = $state(2);
 	let settingTeamNames = $state<string[]>(['チームA','チームB','チームC','チームD']);
 	let settingRespawnSec = $state(30);
 	let savingSettings = $state(false);
 
-	// matchが読み込まれたら設定を反映
 	$effect(() => {
 		if (!match) return;
 		if (match.gameMode) settingMode = match.gameMode;
@@ -698,105 +425,59 @@
 		if (!match) return;
 		const next = STATUS_NEXT[match.status];
 		if (!next) return;
-		joinPanelDismissed = true; // 試合開始/終了でパネルを閉じる
+		joinPanelDismissed = true;
 		updatingStatus = true;
 		try {
 			await updateDoc(doc(db, 'matches', matchId), { status: next });
-		} catch (e) {
-			console.error('Status update failed:', e);
-		} finally {
-			updatingStatus = false;
-		}
+		} catch (e) { console.error('Status update failed:', e); }
+		finally { updatingStatus = false; }
 	}
 
 	// ─── 再生制御 ────────────────────────────────────────────────────────
 	function togglePlayback() {
 		isPlaying ? stopPlayback() : startPlayback();
 	}
-
 	function startPlayback() {
 		if (currentTime >= endTime) currentTime = startTime;
 		isPlaying = true;
 		timer = window.setInterval(() => {
 			currentTime += 1000 * playbackSpeed;
-			if (currentTime >= endTime) {
-				currentTime = endTime;
-				stopPlayback();
-			}
+			if (currentTime >= endTime) { currentTime = endTime; stopPlayback(); }
 		}, 1000);
 	}
-
 	function stopPlayback() {
 		isPlaying = false;
 		clearInterval(timer);
 	}
-
 	function formatTime(ts: number) {
 		if (!ts) return '--:--';
-		return new Date(ts).toLocaleTimeString([], {
-			hour: '2-digit', minute: '2-digit', second: '2-digit'
-		});
+		return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 	}
-
 	function handleSeek(e: Event) {
 		currentTime = Number((e.target as HTMLInputElement).value);
 	}
-
 	function cycleSpeed() {
 		playbackSpeed = playbackSpeed >= 10 ? 1 : playbackSpeed + 2;
 	}
 </script>
 
 <svelte:head>
-	<title>Replay - {matchId}</title>
+	<title>RADAR - {matchId.slice(0, 8)}</title>
 </svelte:head>
 
 <div class="viewer-container">
+	<!-- MGSレーダーマップ -->
 	<div class="map-wrapper" bind:this={mapElement}></div>
 
-	<!-- ステータスバッジ群（右上に小さく） -->
-	<div class="status-badges">
-		{#if calibStatus === 'ready'}
-			<span class="badge badge-ok">✓ GPS連動中</span>
-		{:else if (calibStatus === 'insufficient' || calibStatus === 'no-spawns') && autoAnchorMode}
-			<span class="badge badge-ok">📍 自動位置補正中</span>
-		{:else if calibStatus === 'no-spawns' && currentFieldId}
-			<a href="/fields/{currentFieldId}/edit" class="badge badge-warn">
-				📍 スポーン未設定 — タップして設定
-			</a>
-		{:else if calibStatus === 'insufficient' && currentFieldId}
-			<span class="badge badge-warn">⚠ trackerでスポーン選択してください</span>
-		{:else if calibStatus === 'insufficient'}
-			<span class="badge badge-warn">⚠ GPS記録が不足しています</span>
-		{/if}
-
-		{#if noBoundary && !useVirtualMap}
-			<span class="badge badge-warn">⚠ 境界線未登録</span>
-		{/if}
-	</div>
-
-	<!-- ── デバッグパネル（何も映らないときの診断用） ── -->
-	{#if logs.length === 0 && match?.status !== 'waiting'}
-		<div class="debug-panel">
-			<div class="debug-title">📡 プレイヤー未接続</div>
-			<div class="debug-row">スマホで <code>/track/{matchId}</code> を開いてください</div>
-			<div class="debug-row muted">virtualMap: {useVirtualMap} | calib: {calibStatus}</div>
-		</div>
-	{:else if logs.length > 0}
-		<div class="debug-panel">
-			<div class="debug-title">👥 {logs.length}人接続中</div>
-			{#each logs as p}
-				<div class="debug-row">
-					<span class="debug-dot" style="background:{p.teamColor}"></span>
-					<span>{p.name || p.id?.slice(0,6)}</span>
-					<span class="muted">
-						{p.lastPosition ? '📍GPS' : (p as any).spawnId ? '🏁スポーン待機' : '⌛GPS待機'}
-					</span>
-				</div>
-			{/each}
-			<div class="debug-row muted" style="margin-top:4px">calib: {calibStatus} | anchor: {autoAnchorMode}</div>
+	<!-- スキャンラインオーバーレイ -->
+	{#if showScanLine}
+		<div class="scanline-overlay" aria-hidden="true">
+			<div class="scanline-sweep"></div>
 		</div>
 	{/if}
+
+	<!-- CRTスキャンライン（常時微弱） -->
+	<div class="crt-overlay" aria-hidden="true"></div>
 
 	<!-- ── 生存者オーバーレイ（試合中 / Live のみ） ── -->
 	{#if match?.status === 'playing' && viewMode === 'live' && logs.length > 0}
@@ -807,13 +488,41 @@
 				{@const alive = teamLogs.filter(p => !p.hitEvent).length}
 				{@const total = teamLogs.length}
 				{@const teamName = match?.teams?.find(t => t.id === team)?.name ?? `チーム${team}`}
-				{@const repColor = teamLogs[0]?.teamColor ?? '#aaa'}
+				{@const repColor = teamLogs[0]?.teamColor ?? '#4ade80'}
 				<div class="alive-team">
-					<span class="alive-dot" style="background:{repColor}"></span>
+					<span class="alive-dot" style="background:{repColor};box-shadow:0 0 5px {repColor}"></span>
 					<span class="alive-name">{teamName}</span>
-					<span class="alive-count" style="color:{repColor}">{alive}<span class="alive-total">/{total}</span></span>
+					<span class="alive-count" style="color:{repColor};text-shadow:0 0 8px {repColor}66">
+						{alive}<span class="alive-total">/{total}</span>
+					</span>
 				</div>
 			{/each}
+		</div>
+	{/if}
+
+	<!-- ── デバッグパネル ── -->
+	{#if logs.length === 0 && match?.status !== 'waiting'}
+		<div class="debug-panel">
+			<div class="debug-title">📡 プレイヤー未接続</div>
+			<div class="debug-row">スマホで <code>/track/{matchId}</code> を開いてください</div>
+		</div>
+	{:else if logs.length > 0}
+		<div class="debug-panel">
+			<div class="debug-title">👥 {logs.length}人接続中</div>
+			{#each logs as p}
+				<div class="debug-row">
+					<span class="debug-dot" style="background:{p.teamColor};box-shadow:0 0 4px {p.teamColor}"></span>
+					<span>{p.name || p.id?.slice(0,6)}</span>
+					<span class="muted">{p.lastPosition ? '📍GPS' : '⌛待機'}</span>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	<!-- 境界線なし警告 -->
+	{#if noBoundary}
+		<div class="no-boundary-badge">
+			⚠ 外周未登録 — <a href="/fields/{match?.fieldId}/edit">フィールド設定</a>
 		</div>
 	{/if}
 
@@ -826,13 +535,12 @@
 			</div>
 			<p class="join-panel-sub">スマホのカメラでQRをスキャン</p>
 			<img
-				src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&color=e5e5e5&bgcolor=0a0a0a&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
+				src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&color=4ade80&bgcolor=050f05&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
 				alt="QR Code"
 				class="join-qr"
 			/>
 			<div class="join-url">/track/{matchId.slice(0,12)}…</div>
 
-			<!-- 参加者リスト -->
 			<div class="join-players">
 				{#if logs.length === 0}
 					<span class="join-players-none">まだ誰も参加していません</span>
@@ -841,7 +549,7 @@
 					<div class="join-player-list">
 						{#each logs as p}
 							<div class="join-player-item">
-								<span class="join-player-dot" style="background:{p.teamColor}"></span>
+								<span class="join-player-dot" style="background:{p.teamColor};box-shadow:0 0 4px {p.teamColor}"></span>
 								<span>{p.name || p.id}</span>
 								<span class="join-player-team">{p.team ?? '?'}</span>
 							</div>
@@ -853,7 +561,6 @@
 			<!-- 試合設定 -->
 			<div class="settings-section">
 				<div class="settings-title">⚙ 試合設定</div>
-
 				<div class="settings-row">
 					<span class="settings-label">ゲームモード</span>
 					<select class="settings-select" bind:value={settingMode}>
@@ -862,7 +569,6 @@
 						<option value="timed_respawn">制限時間復活</option>
 					</select>
 				</div>
-
 				{#if settingMode === 'timed_respawn'}
 					<div class="settings-row">
 						<span class="settings-label">復活待機</span>
@@ -872,7 +578,6 @@
 						</div>
 					</div>
 				{/if}
-
 				<div class="settings-row">
 					<span class="settings-label">チーム数</span>
 					<div class="settings-team-btns">
@@ -884,7 +589,6 @@
 						{/each}
 					</div>
 				</div>
-
 				<div class="settings-team-names">
 					{#each Array(settingTeamCount) as _, i}
 						<input
@@ -895,7 +599,6 @@
 						/>
 					{/each}
 				</div>
-
 				<button class="settings-save-btn" onclick={saveMatchSettings} disabled={savingSettings}>
 					{savingSettings ? '保存中…' : '💾 設定を保存'}
 				</button>
@@ -912,9 +615,9 @@
 		<div class="modal-overlay" onclick={() => showQR = false} role="button" tabindex="-1">
 			<div class="modal-box" onclick={(e) => e.stopPropagation()}>
 				<h3 class="modal-title">📱 試合に参加</h3>
-				<p class="modal-sub">スマホのカメラでスキャンしてブラウザで開く</p>
+				<p class="modal-sub">スマホのカメラでスキャン</p>
 				<img
-					src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=e5e5e5&bgcolor=0a0a0a&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
+					src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&color=4ade80&bgcolor=050f05&data={encodeURIComponent(typeof window !== 'undefined' ? `${window.location.origin}/track/${matchId}` : '')}"
 					alt="QR Code"
 					class="qr-img"
 				/>
@@ -942,7 +645,7 @@
 						</div>
 						{#each logs.sort((a,b) => (a.team||'A').localeCompare(b.team||'A')) as player}
 							{@const s = calcStats(player)}
-							<div class="stats-row" style="--c: {player.teamColor || '#aaa'}">
+							<div class="stats-row" style="--c: {player.teamColor || '#4ade80'}">
 								<span class="stats-name">
 									<span class="stats-dot" style="background:{player.teamColor}"></span>
 									{player.name || player.id}
@@ -960,9 +663,9 @@
 		</div>
 	{/if}
 
-	<!-- 下部：コンパクトコントロールバー -->
+	<!-- 下部コントロールバー -->
 	<div class="bottom-bar">
-		<!-- 上段：凡例（プレイヤーがいる時だけ） -->
+		<!-- 凡例行 -->
 		{#if logs.length > 0}
 			{@const teamIds = [...new Set(logs.map(p => p.team ?? 'A'))].sort()}
 			<div class="legend-row">
@@ -972,8 +675,8 @@
 					<span class="team-label">{teamName}</span>
 					{#each teamLogs as player}
 						<div class="legend-item">
-							<span class="legend-dot" style="background: {player.teamColor || '#ff0000'}; opacity:{player.hitEvent ? 0.35 : 1}"></span>
-							<span class="legend-name" style="opacity:{player.hitEvent ? 0.4 : 1}">{player.name || player.id}</span>
+							<span class="legend-dot" style="background:{player.teamColor || '#4ade80'};box-shadow:0 0 4px {player.teamColor};opacity:{player.hitEvent ? 0.3 : 1}"></span>
+							<span class="legend-name" style="opacity:{player.hitEvent ? 0.35 : 1}">{player.name || player.id}</span>
 							{#if player.hitEvent}<span class="hit-badge">💀</span>{/if}
 						</div>
 					{/each}
@@ -981,7 +684,7 @@
 			</div>
 		{/if}
 
-		<!-- 下段：操作行 -->
+		<!-- 操作行 -->
 		<div class="control-row">
 			<a href="/" class="back-btn" aria-label="一覧に戻る">
 				<ArrowLeft size={16} />
@@ -1011,7 +714,6 @@
 				>▶ REPLAY</button>
 			</div>
 
-			<!-- Replayモード時のみシークバー表示 -->
 			{#if viewMode === 'replay'}
 				<div class="seek-group">
 					<button class="icon-btn" onclick={() => { currentTime = startTime; stopPlayback(); }}>
@@ -1028,6 +730,14 @@
 
 			<!-- ツールボタン群 -->
 			<div class="tool-btns">
+				<!-- スキャンライントグル -->
+				<button
+					class="tool-btn {showScanLine ? 'tool-btn-active-green' : ''}"
+					onclick={() => showScanLine = !showScanLine}
+					title="レーダースキャン"
+				>
+					<Radar size={15} />
+				</button>
 				<button class="tool-btn" onclick={() => showQR = true} title="QRコード">
 					<QrCode size={15} />
 				</button>
@@ -1047,19 +757,27 @@
 		margin: 0;
 		padding: 0;
 		overflow: hidden;
-		background: #111;
+		background: #050f05;
 		font-family: 'Inter', system-ui, -apple-system, sans-serif;
 	}
-	:global(.leaflet-container) { background: #111 !important; }
+
+	/* タイルなし・暗い背景のLeafletマップ */
+	:global(.leaflet-container) {
+		background: #050f05 !important;
+	}
+	:global(.leaflet-tile-pane) { display: none; }
+
 	:global(.spawn-label-tip) {
-		background: rgba(0,0,0,0.8) !important;
-		border: 1px solid rgba(74,222,128,0.5) !important;
+		background: rgba(5,15,5,0.92) !important;
+		border: 1px solid rgba(74,222,128,0.4) !important;
 		color: #4ade80 !important;
-		font-size: 11px !important;
-		font-weight: 600 !important;
-		padding: 2px 7px !important;
+		font-size: 10px !important;
+		font-weight: 700 !important;
+		font-family: monospace !important;
+		padding: 2px 6px !important;
 		border-radius: 4px !important;
-		box-shadow: none !important;
+		box-shadow: 0 0 8px rgba(74,222,128,0.2) !important;
+		letter-spacing: 0.05em !important;
 		white-space: nowrap !important;
 	}
 	:global(.spawn-label-tip::before) { display: none !important; }
@@ -1068,69 +786,59 @@
 		position: relative;
 		width: 100vw;
 		height: 100vh;
-		color: white;
+		color: #4ade80;
+		overflow: hidden;
 	}
 
 	.map-wrapper {
-		width: 100%;
-		height: 100%;
+		position: absolute;
+		inset: 0;
 		z-index: 1;
 	}
 
-	.virtual-map-badge {
-		background: rgba(74,222,128,0.12);
-		border: 1px solid rgba(74,222,128,0.3);
-		border-radius: 10px;
-		padding: 6px 14px;
-		color: #4ade80;
-		font-size: 0.78rem;
-		font-weight: 600;
-		text-align: center;
+	/* ─── スキャンラインオーバーレイ（MGSレーダー風） ─── */
+	.scanline-overlay {
+		position: absolute;
+		inset: 0;
+		z-index: 5;
+		pointer-events: none;
+		overflow: hidden;
+	}
+	.scanline-sweep {
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		width: 300%;
+		height: 300%;
+		transform: translate(-50%, -50%);
+		background: conic-gradient(
+			from 0deg,
+			transparent 0deg,
+			transparent 340deg,
+			rgba(74, 222, 128, 0.07) 350deg,
+			rgba(74, 222, 128, 0.18) 360deg
+		);
+		animation: radar-sweep 4s linear infinite;
+	}
+	@keyframes radar-sweep {
+		from { transform: translate(-50%, -50%) rotate(0deg); }
+		to   { transform: translate(-50%, -50%) rotate(360deg); }
 	}
 
-	/* ── デバッグパネル ── */
-	.debug-panel {
+	/* CRTスキャンライン（常時微弱） */
+	.crt-overlay {
 		position: absolute;
-		top: 50px;
-		right: 12px;
-		z-index: 500;
-		background: rgba(10,10,10,0.88);
-		backdrop-filter: blur(12px);
-		border: 1px solid rgba(255,255,255,0.1);
-		border-radius: 12px;
-		padding: 10px 14px;
-		min-width: 180px;
-		max-width: 260px;
-		display: flex;
-		flex-direction: column;
-		gap: 5px;
+		inset: 0;
+		z-index: 6;
 		pointer-events: none;
+		background: repeating-linear-gradient(
+			0deg,
+			transparent,
+			transparent 3px,
+			rgba(0, 0, 0, 0.04) 3px,
+			rgba(0, 0, 0, 0.04) 4px
+		);
 	}
-	.debug-title {
-		font-size: 0.75rem;
-		font-weight: 700;
-		color: rgba(255,255,255,0.6);
-		margin-bottom: 2px;
-	}
-	.debug-row {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 0.7rem;
-		color: rgba(255,255,255,0.75);
-	}
-	.debug-dot {
-		width: 8px; height: 8px;
-		border-radius: 50%;
-		flex-shrink: 0;
-	}
-	.debug-row code {
-		font-size: 0.65rem;
-		background: rgba(255,255,255,0.1);
-		padding: 1px 5px;
-		border-radius: 4px;
-	}
-	.debug-row.muted, .muted { color: rgba(255,255,255,0.3); font-size: 0.65rem; }
 
 	/* ── 生存者オーバーレイ ── */
 	.alive-overlay {
@@ -1147,34 +855,79 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		background: rgba(10,10,10,0.82);
+		background: rgba(5,15,5,0.88);
 		backdrop-filter: blur(12px);
-		border: 1px solid rgba(255,255,255,0.1);
-		border-radius: 12px;
-		padding: 8px 14px;
-		min-width: 120px;
+		border: 1px solid rgba(74,222,128,0.2);
+		border-radius: 10px;
+		padding: 7px 12px;
+		min-width: 110px;
 	}
-	.alive-dot {
-		width: 10px; height: 10px;
-		border-radius: 50%;
-		flex-shrink: 0;
+	.alive-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+	.alive-name { flex: 1; font-size: 0.75rem; font-weight: 600; color: rgba(74,222,128,0.65); font-family: monospace; }
+	.alive-count { font-size: 1.05rem; font-weight: 800; font-variant-numeric: tabular-nums; font-family: monospace; }
+	.alive-total { font-size: 0.68rem; opacity: 0.4; font-weight: 600; }
+
+	/* ── デバッグパネル ── */
+	.debug-panel {
+		position: absolute;
+		top: 12px;
+		right: 12px;
+		z-index: 500;
+		background: rgba(5,15,5,0.88);
+		backdrop-filter: blur(12px);
+		border: 1px solid rgba(74,222,128,0.15);
+		border-radius: 10px;
+		padding: 10px 14px;
+		min-width: 160px;
+		max-width: 240px;
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
+		pointer-events: none;
 	}
-	.alive-name {
-		flex: 1;
-		font-size: 0.78rem;
+	.debug-title {
+		font-size: 0.72rem;
+		font-weight: 700;
+		color: rgba(74,222,128,0.5);
+		margin-bottom: 2px;
+		font-family: monospace;
+		letter-spacing: 0.05em;
+	}
+	.debug-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 0.68rem;
+		color: rgba(74,222,128,0.65);
+		font-family: monospace;
+	}
+	.debug-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+	.debug-row code {
+		font-size: 0.62rem;
+		background: rgba(74,222,128,0.08);
+		padding: 1px 4px;
+		border-radius: 3px;
+	}
+	.muted { color: rgba(74,222,128,0.3) !important; font-size: 0.63rem; }
+
+	/* ── 境界線なし ── */
+	.no-boundary-badge {
+		position: absolute;
+		bottom: 80px;
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: 500;
+		background: rgba(251,191,36,0.1);
+		border: 1px solid rgba(251,191,36,0.35);
+		color: #fbbf24;
+		font-size: 0.72rem;
 		font-weight: 600;
-		color: rgba(255,255,255,0.7);
+		padding: 5px 14px;
+		border-radius: 20px;
+		white-space: nowrap;
+		pointer-events: auto;
 	}
-	.alive-count {
-		font-size: 1.1rem;
-		font-weight: 800;
-		font-variant-numeric: tabular-nums;
-	}
-	.alive-total {
-		font-size: 0.7rem;
-		opacity: 0.45;
-		font-weight: 600;
-	}
+	.no-boundary-badge a { color: #fbbf24; text-decoration: underline; }
 
 	/* ── 待機中参加パネル ── */
 	.join-panel {
@@ -1183,254 +936,128 @@
 		left: 20px;
 		transform: translateY(-50%);
 		z-index: 800;
-		background: rgba(10,10,10,0.94);
+		background: rgba(5,15,5,0.96);
 		backdrop-filter: blur(20px);
 		border: 1px solid rgba(74,222,128,0.3);
-		border-radius: 18px;
-		padding: 18px 20px;
-		width: 220px;
+		border-radius: 16px;
+		padding: 16px 18px;
+		width: 218px;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		gap: 10px;
-		box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+		box-shadow: 0 0 30px rgba(74,222,128,0.08), 0 8px 32px rgba(0,0,0,0.6);
 	}
-	.join-panel-header {
-		width: 100%;
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-	.join-panel-title {
-		font-size: 0.88rem;
-		font-weight: 800;
-		color: #4ade80;
-	}
-	.join-panel-close {
-		background: none;
-		border: none;
-		color: #6b7280;
-		font-size: 0.85rem;
-		cursor: pointer;
-		padding: 2px 4px;
-		line-height: 1;
-	}
-	.join-panel-close:hover { color: #e5e5e5; }
-	.join-panel-sub {
-		font-size: 0.7rem;
-		color: #9ca3af;
-		margin: 0;
-		text-align: center;
-	}
-	.join-qr {
-		width: 160px;
-		height: 160px;
-		border-radius: 10px;
-		border: 1px solid rgba(255,255,255,0.08);
-	}
+	.join-panel-header { width: 100%; display: flex; align-items: center; justify-content: space-between; }
+	.join-panel-title { font-size: 0.85rem; font-weight: 800; color: #4ade80; text-shadow: 0 0 8px rgba(74,222,128,0.5); }
+	.join-panel-close { background: none; border: none; color: rgba(74,222,128,0.35); font-size: 0.85rem; cursor: pointer; padding: 2px 4px; }
+	.join-panel-close:hover { color: #4ade80; }
+	.join-panel-sub { font-size: 0.68rem; color: rgba(74,222,128,0.45); margin: 0; text-align: center; }
+	.join-qr { width: 160px; height: 160px; border-radius: 10px; border: 1px solid rgba(74,222,128,0.2); }
 	.join-url {
-		font-size: 0.65rem;
+		font-size: 0.62rem;
 		font-family: monospace;
-		color: #6b7280;
-		background: rgba(255,255,255,0.04);
-		border: 1px solid rgba(255,255,255,0.08);
-		padding: 4px 8px;
-		border-radius: 6px;
+		color: rgba(74,222,128,0.4);
+		background: rgba(74,222,128,0.04);
+		border: 1px solid rgba(74,222,128,0.1);
+		padding: 3px 8px;
+		border-radius: 5px;
 		width: 100%;
 		text-align: center;
 		box-sizing: border-box;
 	}
 	.join-players { width: 100%; }
-	.join-players-none {
-		font-size: 0.72rem;
-		color: #4b5563;
-		text-align: center;
-		display: block;
-	}
-	.join-players-count {
-		font-size: 0.75rem;
-		color: #4ade80;
-		font-weight: 700;
-		display: block;
-		text-align: center;
-		margin-bottom: 6px;
-	}
-	.join-player-list {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-		max-height: 100px;
-		overflow-y: auto;
-	}
-	.join-player-item {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 0.72rem;
-		color: #d1d5db;
-	}
-	.join-player-dot {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		flex-shrink: 0;
-	}
-	.join-player-team {
-		margin-left: auto;
-		color: #6b7280;
-		font-size: 0.65rem;
-	}
+	.join-players-none { font-size: 0.7rem; color: rgba(74,222,128,0.25); text-align: center; display: block; }
+	.join-players-count { font-size: 0.72rem; color: #4ade80; font-weight: 700; display: block; text-align: center; margin-bottom: 6px; }
+	.join-player-list { display: flex; flex-direction: column; gap: 4px; max-height: 90px; overflow-y: auto; }
+	.join-player-item { display: flex; align-items: center; gap: 6px; font-size: 0.7rem; color: rgba(74,222,128,0.7); font-family: monospace; }
+	.join-player-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+	.join-player-team { margin-left: auto; color: rgba(74,222,128,0.35); font-size: 0.62rem; }
 	.join-start-btn {
 		width: 100%;
-		padding: 12px;
+		padding: 11px;
 		background: #4ade80;
-		color: #000;
+		color: #020c02;
 		border: none;
 		border-radius: 10px;
-		font-size: 0.9rem;
+		font-size: 0.88rem;
 		font-weight: 800;
 		cursor: pointer;
-		margin-top: 2px;
+		letter-spacing: 0.04em;
+		box-shadow: 0 0 16px rgba(74,222,128,0.4);
 	}
-	.join-start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-	.join-start-btn:hover:not(:disabled) { background: #22c55e; }
+	.join-start-btn:hover:not(:disabled) { background: #22c55e; box-shadow: 0 0 24px rgba(74,222,128,0.6); }
+	.join-start-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 	/* ── 試合設定 ── */
 	.settings-section {
 		width: 100%;
-		background: rgba(255,255,255,0.03);
-		border: 1px solid rgba(255,255,255,0.08);
+		background: rgba(74,222,128,0.03);
+		border: 1px solid rgba(74,222,128,0.1);
 		border-radius: 10px;
 		padding: 10px 12px;
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
 	}
-	.settings-title {
-		font-size: 0.72rem;
-		font-weight: 700;
-		color: #6b7280;
-		letter-spacing: 0.05em;
-	}
-	.settings-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 8px;
-	}
-	.settings-label {
-		font-size: 0.72rem;
-		color: #9ca3af;
-		white-space: nowrap;
-	}
+	.settings-title { font-size: 0.68rem; font-weight: 700; color: rgba(74,222,128,0.4); letter-spacing: 0.05em; }
+	.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+	.settings-label { font-size: 0.68rem; color: rgba(74,222,128,0.55); white-space: nowrap; }
 	.settings-select {
-		background: rgba(255,255,255,0.06);
-		border: 1px solid rgba(255,255,255,0.12);
-		border-radius: 6px;
-		color: #e5e5e5;
-		font-size: 0.72rem;
-		padding: 4px 6px;
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.15);
+		border-radius: 5px;
+		color: #4ade80;
+		font-size: 0.68rem;
+		padding: 3px 5px;
 		flex: 1;
 	}
-	.settings-inline {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-	}
+	.settings-inline { display: flex; align-items: center; gap: 4px; }
 	.settings-num {
-		width: 54px;
-		background: rgba(255,255,255,0.06);
-		border: 1px solid rgba(255,255,255,0.12);
-		border-radius: 6px;
-		color: #e5e5e5;
-		font-size: 0.8rem;
-		padding: 4px 6px;
+		width: 52px;
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.15);
+		border-radius: 5px;
+		color: #4ade80;
+		font-size: 0.78rem;
+		padding: 3px 5px;
 		text-align: center;
 	}
-	.settings-unit { font-size: 0.72rem; color: #9ca3af; }
+	.settings-unit { font-size: 0.68rem; color: rgba(74,222,128,0.45); }
 	.settings-team-btns { display: flex; gap: 4px; }
 	.settings-team-btn {
-		width: 30px;
-		height: 24px;
-		border-radius: 6px;
-		border: 1px solid rgba(255,255,255,0.12);
-		background: rgba(255,255,255,0.04);
-		color: rgba(255,255,255,0.4);
-		font-size: 0.8rem;
-		font-weight: 700;
+		width: 28px; height: 22px;
+		border-radius: 5px;
+		border: 1px solid rgba(74,222,128,0.15);
+		background: rgba(74,222,128,0.04);
+		color: rgba(74,222,128,0.35);
+		font-size: 0.75rem; font-weight: 700;
 		cursor: pointer;
 	}
-	.settings-team-btn.active {
-		border-color: #4ade80;
-		background: rgba(74,222,128,0.15);
-		color: #4ade80;
-	}
-	.settings-team-names {
-		display: flex;
-		gap: 4px;
-		flex-wrap: wrap;
-	}
+	.settings-team-btn.active { border-color: #4ade80; background: rgba(74,222,128,0.15); color: #4ade80; }
+	.settings-team-names { display: flex; gap: 4px; flex-wrap: wrap; }
 	.settings-team-name-input {
-		flex: 1;
-		min-width: 60px;
-		background: rgba(255,255,255,0.06);
-		border: 1px solid rgba(255,255,255,0.12);
-		border-radius: 6px;
-		color: #e5e5e5;
-		font-size: 0.72rem;
-		padding: 4px 6px;
+		flex: 1; min-width: 55px;
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.15);
+		border-radius: 5px;
+		color: #4ade80;
+		font-size: 0.68rem;
+		padding: 3px 5px;
 	}
 	.settings-save-btn {
 		width: 100%;
-		padding: 7px;
-		background: rgba(74,222,128,0.1);
-		border: 1px solid rgba(74,222,128,0.3);
-		border-radius: 8px;
+		padding: 6px;
+		background: rgba(74,222,128,0.08);
+		border: 1px solid rgba(74,222,128,0.25);
+		border-radius: 7px;
 		color: #4ade80;
-		font-size: 0.75rem;
+		font-size: 0.72rem;
 		font-weight: 700;
 		cursor: pointer;
 	}
-	.settings-save-btn:hover:not(:disabled) { background: rgba(74,222,128,0.2); }
-	.settings-save-btn:disabled { opacity: 0.5; }
-
-	/* ── ステータスバッジ（右上） ── */
-	.status-badges {
-		position: absolute;
-		top: 10px;
-		right: 10px;
-		z-index: 500;
-		display: flex;
-		flex-direction: column;
-		align-items: flex-end;
-		gap: 5px;
-		pointer-events: none;
-	}
-	.badge {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		font-size: 0.68rem;
-		font-weight: 700;
-		padding: 4px 10px;
-		border-radius: 20px;
-		white-space: nowrap;
-		pointer-events: auto;
-		text-decoration: none;
-		backdrop-filter: blur(8px);
-	}
-	.badge-ok {
-		color: #4ade80;
-		background: rgba(74,222,128,0.12);
-		border: 1px solid rgba(74,222,128,0.35);
-	}
-	.badge-warn {
-		color: #fbbf24;
-		background: rgba(251,191,36,0.12);
-		border: 1px solid rgba(251,191,36,0.35);
-		cursor: pointer;
-	}
-	.badge-warn:hover { background: rgba(251,191,36,0.22); }
+	.settings-save-btn:hover:not(:disabled) { background: rgba(74,222,128,0.16); }
+	.settings-save-btn:disabled { opacity: 0.4; }
 
 	/* ── 下部バー ── */
 	.bottom-bar {
@@ -1439,91 +1066,53 @@
 		left: 0;
 		right: 0;
 		z-index: 1000;
-		background: rgba(14,14,14,0.92);
+		background: rgba(5,15,5,0.94);
 		backdrop-filter: blur(16px);
-		border-top: 1px solid rgba(255,255,255,0.07);
-		padding: 6px 12px 8px;
+		border-top: 1px solid rgba(74,222,128,0.12);
+		padding: 5px 12px 8px;
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
 	}
 
-	/* 凡例行 */
 	.legend-row {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 10px;
 		padding: 2px 0;
 	}
-	.legend-item {
-		display: flex;
-		align-items: center;
-		gap: 5px;
-		font-size: 0.72rem;
-		color: rgba(255,255,255,0.75);
-	}
-	.legend-dot {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		flex-shrink: 0;
-	}
-	.legend-name { font-weight: 500; }
-	.hit-badge { font-size: 0.65rem; opacity: 0.8; }
-
-	/* Live/Replayトグル */
-	.mode-toggle {
-		display: flex;
-		background: rgba(255,255,255,0.06);
-		border: 1px solid rgba(255,255,255,0.1);
-		border-radius: 8px;
-		overflow: hidden;
-		flex-shrink: 0;
-	}
-	.mode-btn {
-		background: transparent;
-		color: rgba(255,255,255,0.4);
-		border: none;
-		padding: 4px 10px;
-		font-size: 0.66rem;
-		font-weight: 700;
-		cursor: pointer;
-		letter-spacing: 0.03em;
-		transition: all 0.15s;
-		white-space: nowrap;
-	}
-	.mode-active-live {
-		background: rgba(239,68,68,0.2);
-		color: #f87171;
-	}
-	.mode-active-replay {
-		background: rgba(74,222,128,0.15);
-		color: #4ade80;
+	.legend-item { display: flex; align-items: center; gap: 5px; font-size: 0.68rem; color: rgba(74,222,128,0.7); }
+	.legend-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+	.legend-name { font-weight: 500; font-family: monospace; }
+	.hit-badge { font-size: 0.62rem; opacity: 0.7; }
+	.team-label {
+		font-size: 0.62rem;
+		font-weight: 800;
+		letter-spacing: 0.06em;
+		color: rgba(74,222,128,0.3);
+		padding-right: 4px;
+		border-right: 1px solid rgba(74,222,128,0.12);
+		margin-right: 2px;
 	}
 
-	/* 操作行 */
-	.control-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
+	.control-row { display: flex; align-items: center; gap: 8px; }
 
 	.back-btn {
 		display: flex;
 		align-items: center;
-		color: rgba(255,255,255,0.35);
+		color: rgba(74,222,128,0.3);
 		text-decoration: none;
 		transition: color 0.15s;
 		flex-shrink: 0;
 	}
-	.back-btn:hover { color: #fff; }
+	.back-btn:hover { color: #4ade80; }
 
 	.status-badge {
 		display: flex;
 		align-items: center;
 		gap: 4px;
-		font-size: 0.68rem;
-		font-weight: 600;
+		font-size: 0.66rem;
+		font-weight: 700;
 		color: var(--c);
 		background: color-mix(in srgb, var(--c) 10%, transparent);
 		border: 1px solid color-mix(in srgb, var(--c) 28%, transparent);
@@ -1531,25 +1120,49 @@
 		border-radius: 20px;
 		white-space: nowrap;
 		flex-shrink: 0;
+		font-family: monospace;
+		letter-spacing: 0.04em;
 	}
 
 	.status-btn {
-		background: rgba(255,255,255,0.08);
-		color: #e5e5e5;
-		border: 1px solid rgba(255,255,255,0.15);
+		background: rgba(74,222,128,0.07);
+		color: #4ade80;
+		border: 1px solid rgba(74,222,128,0.2);
 		padding: 3px 10px;
-		border-radius: 8px;
-		font-size: 0.68rem;
-		font-weight: 600;
+		border-radius: 7px;
+		font-size: 0.66rem;
+		font-weight: 700;
 		cursor: pointer;
-		transition: background 0.15s;
 		white-space: nowrap;
 		flex-shrink: 0;
 	}
-	.status-btn:hover:not(:disabled) { background: rgba(255,255,255,0.15); }
+	.status-btn:hover:not(:disabled) { background: rgba(74,222,128,0.14); }
 	.status-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-	/* シークグループ（残りスペースを占有） */
+	.mode-toggle {
+		display: flex;
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.12);
+		border-radius: 7px;
+		overflow: hidden;
+		flex-shrink: 0;
+	}
+	.mode-btn {
+		background: transparent;
+		color: rgba(74,222,128,0.3);
+		border: none;
+		padding: 4px 10px;
+		font-size: 0.63rem;
+		font-weight: 800;
+		cursor: pointer;
+		letter-spacing: 0.04em;
+		transition: all 0.15s;
+		white-space: nowrap;
+		font-family: monospace;
+	}
+	.mode-active-live { background: rgba(239,68,68,0.15); color: #f87171; }
+	.mode-active-replay { background: rgba(74,222,128,0.12); color: #4ade80; }
+
 	.seek-group {
 		display: flex;
 		align-items: center;
@@ -1557,10 +1170,9 @@
 		flex: 1;
 		min-width: 0;
 	}
-
 	.icon-btn {
 		background: transparent;
-		color: rgba(255,255,255,0.5);
+		color: rgba(74,222,128,0.35);
 		border: none;
 		cursor: pointer;
 		display: flex;
@@ -1569,106 +1181,87 @@
 		transition: color 0.15s;
 		flex-shrink: 0;
 	}
-	.icon-btn:hover { color: #fff; }
-
+	.icon-btn:hover { color: #4ade80; }
 	.play-btn {
-		background: #fff;
-		color: #000;
+		background: #4ade80;
+		color: #020c02;
 		border: none;
-		width: 32px;
-		height: 32px;
+		width: 30px;
+		height: 30px;
 		border-radius: 50%;
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		cursor: pointer;
 		flex-shrink: 0;
-		transition: transform 0.12s;
+		box-shadow: 0 0 10px rgba(74,222,128,0.4);
 	}
-	.play-btn:hover { transform: scale(1.08); }
-
+	.play-btn:hover { box-shadow: 0 0 18px rgba(74,222,128,0.6); }
 	.seekbar {
 		flex: 1;
 		min-width: 0;
-		height: 4px;
+		height: 3px;
 		-webkit-appearance: none;
 		appearance: none;
-		background: rgba(255,255,255,0.15);
+		background: rgba(74,222,128,0.15);
 		border-radius: 2px;
 		outline: none;
 		cursor: pointer;
 	}
 	.seekbar::-webkit-slider-thumb {
 		-webkit-appearance: none;
-		width: 14px;
-		height: 14px;
-		background: #fff;
+		width: 12px;
+		height: 12px;
+		background: #4ade80;
 		border-radius: 50%;
-		box-shadow: 0 0 6px rgba(0,0,0,0.5);
+		box-shadow: 0 0 6px rgba(74,222,128,0.6);
 	}
-
 	.time-label {
-		font-size: 0.7rem;
+		font-size: 0.67rem;
 		font-variant-numeric: tabular-nums;
 		color: #4ade80;
-		font-weight: 600;
+		font-weight: 700;
 		white-space: nowrap;
 		flex-shrink: 0;
+		font-family: monospace;
 	}
-
 	.speed-btn {
 		background: transparent;
-		color: rgba(255,255,255,0.55);
+		color: rgba(74,222,128,0.4);
 		border: none;
 		cursor: pointer;
-		font-size: 0.7rem;
-		font-weight: 700;
+		font-size: 0.67rem;
+		font-weight: 800;
 		padding: 0;
 		white-space: nowrap;
 		flex-shrink: 0;
-		transition: color 0.15s;
+		font-family: monospace;
 	}
-	.speed-btn:hover { color: #fff; }
+	.speed-btn:hover { color: #4ade80; }
 
-	/* ── チームラベル ── */
-	.team-label {
-		font-size: 0.65rem;
-		font-weight: 800;
-		letter-spacing: 0.06em;
-		color: rgba(255,255,255,0.3);
-		padding-right: 4px;
-		border-right: 1px solid rgba(255,255,255,0.1);
-		margin-right: 2px;
-	}
-
-	/* ── ツールボタン ── */
-	.tool-btns {
-		display: flex;
-		gap: 4px;
-		margin-left: auto;
-		flex-shrink: 0;
-	}
+	.tool-btns { display: flex; gap: 4px; margin-left: auto; flex-shrink: 0; }
 	.tool-btn {
-		background: rgba(255,255,255,0.06);
-		border: 1px solid rgba(255,255,255,0.1);
-		color: rgba(255,255,255,0.45);
-		border-radius: 7px;
-		width: 30px;
-		height: 30px;
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.12);
+		color: rgba(74,222,128,0.35);
+		border-radius: 6px;
+		width: 29px;
+		height: 29px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		cursor: pointer;
 		transition: all 0.15s;
 	}
-	.tool-btn:hover { color: #fff; background: rgba(255,255,255,0.12); }
+	.tool-btn:hover { color: #4ade80; background: rgba(74,222,128,0.12); }
+	.tool-btn-active-green { color: #4ade80 !important; background: rgba(74,222,128,0.18) !important; border-color: rgba(74,222,128,0.45) !important; box-shadow: 0 0 8px rgba(74,222,128,0.3); }
 	.tool-btn-active { color: #f97316 !important; background: rgba(249,115,22,0.15) !important; border-color: rgba(249,115,22,0.4) !important; }
 
-	/* ── モーダル共通 ── */
+	/* ── モーダル ── */
 	.modal-overlay {
 		position: fixed;
 		inset: 0;
-		background: rgba(0,0,0,0.75);
+		background: rgba(0,0,0,0.82);
 		z-index: 2000;
 		display: flex;
 		align-items: center;
@@ -1676,10 +1269,10 @@
 		backdrop-filter: blur(4px);
 	}
 	.modal-box {
-		background: #141414;
-		border: 1px solid rgba(255,255,255,0.1);
-		border-radius: 18px;
-		padding: 28px 24px 22px;
+		background: #050f05;
+		border: 1px solid rgba(74,222,128,0.2);
+		border-radius: 16px;
+		padding: 26px 22px 20px;
 		min-width: 260px;
 		max-width: 420px;
 		width: 90vw;
@@ -1687,25 +1280,26 @@
 		flex-direction: column;
 		align-items: center;
 		gap: 12px;
+		box-shadow: 0 0 30px rgba(74,222,128,0.1);
 	}
 	.modal-wide { max-width: 560px; align-items: stretch; }
-	.modal-title { font-size: 1.1rem; font-weight: 700; margin: 0; }
-	.modal-sub { font-size: 0.8rem; color: #6b7280; margin: -4px 0; text-align: center; }
-	.modal-url { font-size: 0.7rem; font-family: monospace; color: #6b7280; word-break: break-all; text-align: center; }
+	.modal-title { font-size: 1.05rem; font-weight: 700; margin: 0; color: #4ade80; }
+	.modal-sub { font-size: 0.75rem; color: rgba(74,222,128,0.4); margin: -4px 0; text-align: center; }
+	.modal-url { font-size: 0.68rem; font-family: monospace; color: rgba(74,222,128,0.35); word-break: break-all; text-align: center; }
 	.modal-close {
 		margin-top: 4px;
-		background: rgba(255,255,255,0.07);
-		border: 1px solid rgba(255,255,255,0.12);
-		color: #e5e5e5;
-		border-radius: 8px;
+		background: rgba(74,222,128,0.07);
+		border: 1px solid rgba(74,222,128,0.2);
+		color: #4ade80;
+		border-radius: 7px;
 		padding: 7px 22px;
 		cursor: pointer;
-		font-size: 0.82rem;
+		font-size: 0.8rem;
 		font-weight: 600;
 		width: 100%;
 	}
-	.modal-close:hover { background: rgba(255,255,255,0.14); }
-	.qr-img { border-radius: 12px; width: 200px; height: 200px; }
+	.modal-close:hover { background: rgba(74,222,128,0.14); }
+	.qr-img { border-radius: 10px; width: 200px; height: 200px; }
 
 	/* ── 統計テーブル ── */
 	.stats-table { width: 100%; display: flex; flex-direction: column; gap: 2px; }
@@ -1713,27 +1307,28 @@
 		display: grid;
 		grid-template-columns: 1.8fr 0.8fr 1fr 1fr 1fr;
 		gap: 8px;
-		font-size: 0.68rem;
+		font-size: 0.65rem;
 		font-weight: 700;
-		color: #6b7280;
+		color: rgba(74,222,128,0.35);
 		padding: 4px 8px;
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.06em;
+		font-family: monospace;
 	}
 	.stats-row {
 		display: grid;
 		grid-template-columns: 1.8fr 0.8fr 1fr 1fr 1fr;
 		gap: 8px;
-		font-size: 0.78rem;
-		padding: 8px 8px;
-		border-radius: 8px;
-		background: rgba(255,255,255,0.03);
+		font-size: 0.76rem;
+		padding: 7px 8px;
+		border-radius: 7px;
+		background: rgba(74,222,128,0.03);
 		align-items: center;
-		border-left: 3px solid var(--c);
+		border-left: 2px solid var(--c);
 	}
-	.stats-name { display: flex; align-items: center; gap: 7px; font-weight: 600; }
-	.stats-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-	.stats-team { color: #9ca3af; font-size: 0.72rem; }
-	.stats-val { font-variant-numeric: tabular-nums; color: #d1d5db; }
-	.stats-result { font-size: 0.72rem; }
+	.stats-name { display: flex; align-items: center; gap: 7px; font-weight: 600; color: rgba(74,222,128,0.8); }
+	.stats-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+	.stats-team { color: rgba(74,222,128,0.4); font-size: 0.68rem; }
+	.stats-val { font-variant-numeric: tabular-nums; color: rgba(74,222,128,0.65); font-family: monospace; }
+	.stats-result { font-size: 0.7rem; }
 </style>

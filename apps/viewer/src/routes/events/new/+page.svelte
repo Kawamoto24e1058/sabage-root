@@ -4,7 +4,10 @@
 	import { db, storage } from '$lib/firebase';
 	import { collection, addDoc } from 'firebase/firestore';
 	import { ref as storageRef, uploadBytes, getDownloadURL } from 'firebase/storage';
-	import type { SpawnPoint, VirtualPoint, ObstacleLine } from 'shared-types';
+	import type { SpawnPoint } from 'shared-types';
+	// Legacy types (virtual map removed — kept as any for backwards compatibility)
+	type VirtualPoint = { x: number; y: number };
+	type ObstacleLine = { points: VirtualPoint[] };
 	import { ArrowLeft, ArrowRight, Check, MapPin, Plus, Trash2, Pencil } from 'lucide-svelte';
 
 	// ウィザードステップ
@@ -169,8 +172,9 @@
 				const sp: SpawnPoint = {
 					id: `spawn-${Date.now()}`,
 					label: `スポーン ${spawnPoints.length+1}`,
-					x, y
+					lat: 0, lng: 0,
 				};
+				(sp as any).x = x; (sp as any).y = y; // legacy virtual coords
 				spawnPoints = [...spawnPoints, sp];
 				renderSpawns();
 			}
@@ -275,7 +279,7 @@
 		obstaclePolylines.forEach(l => l.remove());
 		obstaclePolylines = [];
 		obstacles.forEach(obs => {
-			const pts = obs.points.map(p => toLL(p));
+			const pts = obs.points.map((p: VirtualPoint) => toLL(p));
 			const line = L.polyline(pts, {
 				color: '#fbbf24', weight: 2, opacity: 0.4, dashArray: '5 4'
 			}).addTo(leafletMap);
@@ -301,7 +305,7 @@
 				">${i+1}</div>`,
 				iconSize: [28,28], iconAnchor: [14,14], className: ''
 			});
-			const m = L.marker(toLL(sp), { icon, draggable: true });
+			const m = L.marker(toLL(sp as unknown as VirtualPoint), { icon, draggable: true });
 			m.addTo(leafletMap);
 			m.bindTooltip(sp.label, {
 				permanent: true, direction: 'top', offset: [0,-16], className: 'spawn-tooltip'
@@ -408,7 +412,7 @@
 				name: eventName,
 				boundary: [],
 				fieldWidthMeters: Number(fieldWidthMeters) || 80,
-				spawnPoints: spawnPoints.map(({id,label,x,y}) => ({id,label,x,y})),
+				spawnPoints: spawnPoints.map(({id,label}) => ({id,label,lat:0,lng:0})),
 				virtualBoundary: virtualBoundary,
 				obstacles: obstacles,
 				...(uploadedUrl ? { mapImage: { url: uploadedUrl } } : {}),

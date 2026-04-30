@@ -1,586 +1,736 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/state';
-	import { goto } from '$app/navigation';
 	import { db } from '$lib/firebase';
-	import { doc, getDoc, updateDoc } from 'firebase/firestore';
-	import type { Field, SpawnPoint } from 'shared-types';
-	import { ArrowLeft, Save, Trash2, MapPin, Plus } from 'lucide-svelte';
+	import { doc, getDoc, updateDoc, setDoc } from 'firebase/firestore';
+	import type { Field, GeoPoint, SpawnPoint } from 'shared-types';
+	import { MapPin, Navigation, Trash2, CheckCircle, Plus, ArrowLeft } from 'lucide-svelte';
 
-	const fieldId = page.params.fieldId;
+	const fieldId = page.params.fieldId ?? '';
 
 	let field = $state<Field | null>(null);
 	let loading = $state(true);
 	let saving = $state(false);
-	let loadError = $state('');
-	let addMode = $state(false);
+	let saveMsg = $state('');
 
+	// フィールド名
+	let fieldName = $state('');
+
+	// 外周記録
+	let boundaryPoints = $state<GeoPoint[]>([]);
+	let isRecordingBoundary = $state(false);
+	let lastRecordedPos: GeoPoint | null = null;
+	const BOUNDARY_INTERVAL_M = 5; // 5m進んだら自動追加
+
+	// スポーン地点
 	let spawnPoints = $state<SpawnPoint[]>([]);
-	let fieldWidthMeters = $state<number>(80); // フィールド横幅（実寸m）
+	let newSpawnLabel = $state('');
+	let addingSpawn = $state(false);
 
-	// 外周GPS計測
-	let measuring = $state(false);
-	let measurePts = $state<{lat: number; lng: number}[]>([]);
-	let measureWatchId = $state<number | null>(null);
-	let measureStatus = $state(''); // 'recording' | 'done' | ''
+	// 現在地
+	let currentPos = $state<GeolocationPosition | null>(null);
+	let gpsWatchId: number | null = null;
+	let gpsError = $state('');
 
-	function haversineM(a: {lat:number;lng:number}, b: {lat:number;lng:number}): number {
+	// ステータス
+	let status = $state('');
+
+	function haversineM(lat1: number, lng1: number, lat2: number, lng2: number): number {
 		const R = 6371000;
-		const dLat = (b.lat - a.lat) * Math.PI / 180;
-		const dLng = (b.lng - a.lng) * Math.PI / 180;
-		const aa = Math.sin(dLat/2)**2 + Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
-		return R * 2 * Math.atan2(Math.sqrt(aa), Math.sqrt(1-aa));
+		const dLat = (lat2 - lat1) * Math.PI / 180;
+		const dLng = (lng2 - lng1) * Math.PI / 180;
+		const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+		return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 	}
-
-	function startMeasure() {
-		if (!navigator.geolocation) { alert('このブラウザはGPS非対応です'); return; }
-		measurePts = [];
-		measuring = true;
-		measureStatus = 'recording';
-		let lastPt: {lat:number;lng:number} | null = null;
-		measureWatchId = navigator.geolocation.watchPosition(
-			(pos) => {
-				const pt = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-				if (!lastPt || haversineM(lastPt, pt) > 1) { // 1m以上動いたら記録
-					measurePts = [...measurePts, pt];
-					lastPt = pt;
-				}
-			},
-			(err) => { console.warn('GPS error', err); },
-			{ enableHighAccuracy: true, maximumAge: 0 }
-		);
-	}
-
-	function stopMeasure() {
-		if (measureWatchId !== null) { navigator.geolocation.clearWatch(measureWatchId); measureWatchId = null; }
-		measuring = false;
-		if (measurePts.length < 2) { measureStatus = ''; alert('GPS点が少なすぎます。もう少し歩いてください。'); return; }
-		// 全点ペア間の最大距離を横幅とする
-		let maxD = 0;
-		for (let i = 0; i < measurePts.length; i++) {
-			for (let j = i+1; j < measurePts.length; j++) {
-				const d = haversineM(measurePts[i], measurePts[j]);
-				if (d > maxD) maxD = d;
-			}
-		}
-		fieldWidthMeters = Math.round(maxD);
-		measureStatus = 'done';
-	}
-
-	let mapElement: HTMLDivElement;
-	let map: any = null;
-	let L: any = null;
-	let markers: any[] = [];
-	let imgW = 1;
-	let imgH = 1;
 
 	onMount(async () => {
-		// フィールドデータ取得
-		try {
+		// フィールドデータ読み込み
+		if (fieldId && fieldId !== 'new') {
 			const snap = await getDoc(doc(db, 'fields', fieldId));
-			if (!snap.exists()) { loadError = 'フィールドが見つかりません'; loading = false; return; }
-			field = { id: snap.id, ...snap.data() } as Field & { id: string };
-			spawnPoints = [...(field.spawnPoints ?? [])];
-			if (field.fieldWidthMeters) fieldWidthMeters = field.fieldWidthMeters;
-		} catch (e) {
-			loadError = '読み込みに失敗しました';
-			loading = false;
-			return;
+			if (snap.exists()) {
+				field = { id: snap.id, ...snap.data() } as Field;
+				fieldName = field.name;
+				boundaryPoints = [...(field.boundary ?? [])];
+				spawnPoints = [...(field.spawnPoints ?? [])];
+			}
 		}
 		loading = false;
 
-		if (!field?.mapImage?.url) return;
+		// GPS常時取得（現在地表示 + 外周自動記録）
+		if (navigator.geolocation) {
+			gpsWatchId = navigator.geolocation.watchPosition(
+				(pos) => {
+					currentPos = pos;
+					gpsError = '';
 
-		// 画像サイズ取得
-		await new Promise<void>(resolve => {
-			const img = new Image();
-			img.onload = () => { imgW = img.naturalWidth || 1; imgH = img.naturalHeight || 1; resolve(); };
-			img.onerror = () => resolve();
-			img.src = field!.mapImage!.url;
-		});
-
-		// Leaflet 初期化
-		const leaflet = await import('leaflet');
-		await import('leaflet/dist/leaflet.css');
-		L = leaflet.default;
-
-		map = L.map(mapElement, {
-			crs: L.CRS.Simple,
-			minZoom: -5,
-			maxZoom: 5,
-			zoomSnap: 0.25,
-			attributionControl: false,
-		});
-
-		// 画像オーバーレイ（半透明）
-		L.imageOverlay(field!.mapImage!.url, [[0, 0], [imgH, imgW]], { opacity: 0.65 }).addTo(map);
-		map.fitBounds([[0, 0], [imgH, imgW]], { padding: [30, 30] });
-
-		// AI検出の仮想境界線（参考表示・薄め）
-		const vb = field?.virtualBoundary;
-		if (vb && vb.length >= 3) {
-			const pts = vb.map(p => [(1 - p.y) * imgH, p.x * imgW] as [number, number]);
-			L.polygon(pts, {
-				color: '#4ade80', weight: 1.5, opacity: 0.35,
-				fillOpacity: 0.04, dashArray: '6 4'
-			}).addTo(map);
+					// 外周記録中：5m進んだら自動追加
+					if (isRecordingBoundary) {
+						const lat = pos.coords.latitude;
+						const lng = pos.coords.longitude;
+						if (!lastRecordedPos || haversineM(lastRecordedPos.lat, lastRecordedPos.lng, lat, lng) >= BOUNDARY_INTERVAL_M) {
+							boundaryPoints = [...boundaryPoints, { lat, lng }];
+							lastRecordedPos = { lat, lng };
+							status = `外周点 ${boundaryPoints.length} 個記録中…`;
+						}
+					}
+				},
+				(err) => { gpsError = `GPS取得失敗: ${err.message}`; },
+				{ enableHighAccuracy: true, timeout: 15000, maximumAge: 2000 }
+			);
 		}
-
-		// AI検出の障害物（参考表示・薄め）
-		field?.obstacles?.forEach(obs => {
-			const pts = obs.points.map(p => [(1 - p.y) * imgH, p.x * imgW] as [number, number]);
-			L.polyline(pts, { color: '#fbbf24', weight: 1.5, opacity: 0.3 }).addTo(map);
-		});
-
-		// 既存スポーンピンを描画
-		renderMarkers();
-
-		// クリックでスポーン追加
-		map.on('click', (e: any) => {
-			if (!addMode) return;
-			const x = Math.max(0, Math.min(1, e.latlng.lng / imgW));
-			const y = Math.max(0, Math.min(1, 1 - e.latlng.lat / imgH)); // Leaflet y軸反転補正
-			const newSpawn: SpawnPoint = {
-				id: `spawn-${Date.now()}`,
-				label: `スポーン ${spawnPoints.length + 1}`,
-				x, y,
-			};
-			spawnPoints = [...spawnPoints, newSpawn];
-			renderMarkers();
-		});
 	});
 
 	onDestroy(() => {
-		if (map) { map.remove(); map = null; }
-		if (measureWatchId !== null) { navigator.geolocation.clearWatch(measureWatchId); }
+		if (gpsWatchId !== null) navigator.geolocation.clearWatch(gpsWatchId);
 	});
 
-	function renderMarkers() {
-		if (!map || !L) return;
-		markers.forEach(m => m.remove());
-		markers = [];
-
-		spawnPoints.forEach((sp, i) => {
-			const icon = L.divIcon({
-				html: `<div style="
-					width:32px;height:32px;border-radius:50%;
-					background:#4ade80;border:3px solid #fff;
-					color:#000;font-size:13px;font-weight:700;
-					display:flex;align-items:center;justify-content:center;
-					box-shadow:0 2px 10px rgba(0,0,0,0.7);
-					cursor:grab;
-				">${i + 1}</div>`,
-				iconSize: [32, 32],
-				iconAnchor: [16, 16],
-				className: '',
-			});
-
-			const marker = L.marker([(1 - sp.y) * imgH, sp.x * imgW], { icon, draggable: true });
-			marker.addTo(map);
-
-			// ツールチップ（ラベル表示）
-			marker.bindTooltip(sp.label, {
-				permanent: true,
-				direction: 'top',
-				offset: [0, -18],
-				className: 'spawn-tooltip',
-			});
-
-			// ドラッグで座標更新
-			marker.on('dragend', (e: any) => {
-				const latlng = e.target.getLatLng();
-				const x = Math.max(0, Math.min(1, latlng.lng / imgW));
-				const y = Math.max(0, Math.min(1, 1 - latlng.lat / imgH)); // Leaflet y軸反転補正
-				spawnPoints = spawnPoints.map((s, idx) => idx === i ? { ...s, x, y } : s);
-				// ツールチップ位置は自動更新されるのでrenderMarkersは不要
-			});
-
-			markers.push(marker);
-		});
+	// ── 外周記録 ────────────────────────────────────────────────────────
+	function startBoundaryRecord() {
+		boundaryPoints = [];
+		lastRecordedPos = null;
+		isRecordingBoundary = true;
+		status = 'フィールドの外周を歩いてください — 自動で記録します';
 	}
 
-	// spawnPoints が変わったらマーカーを再描画（ラベル変更・削除に対応）
-	$effect(() => {
-		// spawnPointsへの依存を登録
-		const _ = spawnPoints.length;
-		if (map && L) renderMarkers();
-	});
-
-	function removeSpawn(index: number) {
-		spawnPoints = spawnPoints.filter((_, i) => i !== index);
+	function stopBoundaryRecord() {
+		isRecordingBoundary = false;
+		status = boundaryPoints.length >= 3
+			? `✅ 外周 ${boundaryPoints.length} 点記録完了`
+			: '⚠ 点が少なすぎます（3点以上必要）';
 	}
 
-	function updateLabel(index: number, label: string) {
-		spawnPoints = spawnPoints.map((sp, i) => i === index ? { ...sp, label } : sp);
+	function clearBoundary() {
+		boundaryPoints = [];
+		lastRecordedPos = null;
+		isRecordingBoundary = false;
+		status = '外周をリセットしました';
 	}
 
-	async function save() {
-		if (!fieldId) return;
-		saving = true;
-		try {
-			await updateDoc(doc(db, 'fields', fieldId), {
-				spawnPoints: spawnPoints.map(({ id, label, x, y }) => ({ id, label, x, y })),
-				fieldWidthMeters: Number(fieldWidthMeters) || 80,
-			});
-			goto('/');
-		} catch (e) {
-			console.error(e);
-			alert('保存に失敗しました');
-		} finally {
-			saving = false;
+	// ── スポーン追加 ─────────────────────────────────────────────────────
+	function addSpawnAtCurrentPos() {
+		if (!currentPos) {
+			status = '⚠ GPS未取得です。しばらくお待ちください';
+			return;
 		}
+		const label = newSpawnLabel.trim() || `スポーン ${spawnPoints.length + 1}`;
+		const id = `spawn-${Date.now()}`;
+		spawnPoints = [
+			...spawnPoints,
+			{
+				id,
+				label,
+				lat: currentPos.coords.latitude,
+				lng: currentPos.coords.longitude,
+			},
+		];
+		newSpawnLabel = '';
+		addingSpawn = false;
+		status = `✅ "${label}" を現在地に追加しました`;
+	}
+
+	function removeSpawn(id: string) {
+		spawnPoints = spawnPoints.filter(s => s.id !== id);
+	}
+
+	// ── 保存 ─────────────────────────────────────────────────────────────
+	async function save() {
+		if (!fieldName.trim()) { status = '⚠ フィールド名を入力してください'; return; }
+		saving = true;
+		const data: Omit<Field, 'id'> = {
+			name: fieldName.trim(),
+			boundary: boundaryPoints,
+			spawnPoints,
+		};
+		try {
+			if (fieldId && fieldId !== 'new') {
+				await updateDoc(doc(db, 'fields', fieldId), data as Record<string, unknown>);
+			} else {
+				const newRef = doc(db, 'fields', crypto.randomUUID());
+				await setDoc(newRef, data);
+			}
+			saveMsg = '✅ 保存しました';
+			setTimeout(() => saveMsg = '', 3000);
+		} catch (e) {
+			saveMsg = `❌ 保存失敗: ${(e as Error).message}`;
+		}
+		saving = false;
+	}
+
+	function accuracyLabel(acc: number): string {
+		if (acc < 5)  return '高精度';
+		if (acc < 15) return '良好';
+		if (acc < 30) return '普通';
+		return '低精度';
 	}
 </script>
 
 <svelte:head>
-	<title>スポーン地点を編集 – Sabage Tracker</title>
+	<title>フィールド編集</title>
 </svelte:head>
 
 <div class="page">
-	<header>
-		<div class="header-inner">
-			<button class="back-btn" onclick={() => goto('/')}>
-				<ArrowLeft size={16} />戻る
-			</button>
-			<h1>スポーン地点を設定</h1>
-			<button class="save-btn" onclick={save} disabled={saving || loading}>
-				<Save size={15} />
-				{saving ? '保存中...' : '保存'}
-			</button>
-		</div>
-	</header>
+	<!-- ヘッダー -->
+	<div class="header">
+		<a href="/fields" class="back-link">
+			<ArrowLeft size={18} />
+		</a>
+		<h1 class="title">フィールド設定</h1>
+		<button class="save-btn" onclick={save} disabled={saving}>
+			{saving ? '保存中…' : '保存'}
+		</button>
+	</div>
 
 	{#if loading}
-		<div class="center-msg">読み込み中...</div>
-	{:else if loadError}
-		<div class="center-msg error">{loadError}</div>
-	{:else if !field?.mapImage?.url}
-		<div class="center-msg">
-			<p>このフィールドにはマップ画像がありません。</p>
-			<a href="/fields/new" class="link">フィールドを再作成する →</a>
-		</div>
+		<div class="loading">読み込み中…</div>
 	{:else}
-		<div class="layout">
-			<!-- 地図エリア -->
-			<div class="map-wrap">
-				<div bind:this={mapElement} class="map"></div>
 
-				<!-- 操作ヒント -->
-				<div class="map-hint" class:add-active={addMode}>
-					{#if addMode}
-						📍 地図上をクリックしてスポーンを追加　<button class="hint-cancel" onclick={() => addMode = false}>完了</button>
-					{:else}
-						ズーム・パンで位置を確認してから追加してください
-					{/if}
-				</div>
+	<!-- GPS状態バー -->
+	<div class="gps-bar {currentPos ? 'gps-ok' : 'gps-wait'}">
+		<Navigation size={13} />
+		{#if currentPos}
+			精度 {Math.round(currentPos.coords.accuracy)}m（{accuracyLabel(currentPos.coords.accuracy)}）
+			— {currentPos.coords.latitude.toFixed(6)}, {currentPos.coords.longitude.toFixed(6)}
+		{:else if gpsError}
+			{gpsError}
+		{:else}
+			GPS取得中…
+		{/if}
+	</div>
+
+	<!-- ステータス -->
+	{#if status}
+		<div class="status-msg">{status}</div>
+	{/if}
+	{#if saveMsg}
+		<div class="save-msg">{saveMsg}</div>
+	{/if}
+
+	<!-- フィールド名 -->
+	<section class="section">
+		<label class="section-label" for="fname">フィールド名</label>
+		<input
+			id="fname"
+			class="text-input"
+			type="text"
+			placeholder="例: ○○サバゲーフィールド"
+			bind:value={fieldName}
+		/>
+	</section>
+
+	<!-- ── 外周記録セクション ── -->
+	<section class="section">
+		<div class="section-header">
+			<div>
+				<div class="section-label">フィールド外周</div>
+				<div class="section-sub">外周を歩くだけで自動記録（5m間隔）</div>
+			</div>
+			<span class="count-badge">{boundaryPoints.length} 点</span>
+		</div>
+
+		{#if !isRecordingBoundary}
+			<div class="btn-row">
+				<button
+					class="btn btn-primary"
+					onclick={startBoundaryRecord}
+					disabled={!currentPos}
+				>
+					<Navigation size={15} />
+					{boundaryPoints.length > 0 ? '外周を再記録' : '外周を記録開始'}
+				</button>
+				{#if boundaryPoints.length > 0}
+					<button class="btn btn-danger-outline" onclick={clearBoundary}>
+						<Trash2 size={14} />
+						リセット
+					</button>
+				{/if}
 			</div>
 
-			<!-- サイドパネル -->
-			<aside class="panel">
-				<div class="panel-header">
-					<h2><MapPin size={14} />スポーン地点</h2>
-					<span class="spawn-count">{spawnPoints.length}点</span>
+			{#if boundaryPoints.length >= 3}
+				<div class="boundary-ok">
+					<CheckCircle size={14} />
+					外周 {boundaryPoints.length} 点を記録済み
 				</div>
-
-				<button
-					class="add-btn"
-					class:active={addMode}
-					onclick={() => addMode = !addMode}
-				>
-					<Plus size={14} />
-					{addMode ? '追加モード中（地図をクリック）' : 'スポーンを追加'}
+			{:else if boundaryPoints.length > 0}
+				<div class="boundary-warn">⚠ 3点以上必要です（現在 {boundaryPoints.length} 点）</div>
+			{/if}
+		{:else}
+			<!-- 記録中UI -->
+			<div class="recording-card">
+				<div class="recording-pulse"></div>
+				<div class="recording-info">
+					<span class="recording-label">記録中</span>
+					<span class="recording-count">{boundaryPoints.length} 点</span>
+				</div>
+				<p class="recording-hint">外周に沿って歩いてください<br>5m進むたびに自動で点を追加します</p>
+				<button class="btn btn-stop" onclick={stopBoundaryRecord}>
+					■ 記録を停止
 				</button>
+			</div>
+		{/if}
 
-				{#if spawnPoints.length === 0}
-					<p class="empty-hint">
-						「スポーンを追加」を押して地図上をクリックすると、スポーン地点を設置できます。
-					</p>
-				{:else}
-					<ul class="spawn-list">
-						{#each spawnPoints as sp, i}
-							<li class="spawn-item">
-								<div class="spawn-num">{i + 1}</div>
-								<div class="spawn-body">
-									<input
-										class="spawn-label-input"
-										type="text"
-										value={sp.label}
-										oninput={(e) => updateLabel(i, (e.target as HTMLInputElement).value)}
-										placeholder="例: チームAスポーン"
-										maxlength="24"
-									/>
-									<span class="spawn-coords">
-										x: {sp.x.toFixed(3)} / y: {sp.y.toFixed(3)}
-									</span>
-								</div>
-								<button class="del-btn" onclick={() => removeSpawn(i)} title="削除">
-									<Trash2 size={13} />
-								</button>
-							</li>
-						{/each}
-					</ul>
-
-					{#if spawnPoints.length < 2}
-						<p class="warn">仮想マップのGPS変換には2点以上必要です</p>
-					{:else}
-						<p class="ok">✓ {spawnPoints.length}点設定済み — 精度向上には離れた2点が重要です</p>
-					{/if}
-				{/if}
-
-				<!-- フィールド横幅設定 -->
-				<div class="field-width-row">
-					<label class="field-width-label">📐 フィールド実寸（最大幅）</label>
-
-					<!-- GPS計測ボタン -->
-					{#if !measuring}
-						<button class="measure-btn" onclick={startMeasure}>
-							🚶 外周を歩いて自動計測
-						</button>
-					{:else}
-						<div class="measuring-state">
-							<div class="measure-pulse">● 計測中 — {measurePts.length}点取得</div>
-							<button class="measure-stop-btn" onclick={stopMeasure}>
-								✅ 計測完了
-							</button>
-						</div>
-					{/if}
-
-					{#if measureStatus === 'done'}
-						<p class="measure-result">✓ 計測結果: <strong>{fieldWidthMeters} m</strong> を設定しました</p>
-					{/if}
-
-					<div class="field-width-input-wrap">
-						<input class="field-width-input" type="number" min="10" max="2000" bind:value={fieldWidthMeters} />
-						<span class="field-width-unit">m（手動入力も可）</span>
+		<!-- 記録済み点のリスト（最新5件） -->
+		{#if boundaryPoints.length > 0 && !isRecordingBoundary}
+			<div class="point-list">
+				<div class="point-list-title">記録した外周点（{boundaryPoints.length}点）</div>
+				{#each boundaryPoints.slice(-5).reverse() as pt, i}
+					<div class="point-item">
+						<span class="point-num">#{boundaryPoints.length - i}</span>
+						<span class="point-coord">{pt.lat.toFixed(6)}, {pt.lng.toFixed(6)}</span>
 					</div>
-					<p class="field-width-hint">スポーン1点でのGPS位置推定に使います。スマホで外周を1周歩くと自動計算されます。</p>
-				</div>
+				{/each}
+				{#if boundaryPoints.length > 5}
+					<div class="point-more">… 他 {boundaryPoints.length - 5} 点</div>
+				{/if}
+			</div>
+		{/if}
+	</section>
 
-				<div class="how-to">
-					<p class="how-to-title">使い方</p>
-					<ol>
-						<li>「スポーンを追加」→ 地図上のスポーン位置をクリック</li>
-						<li>ドラッグで微調整（ズームすると精確に）</li>
-						<li>ラベルをチームに合わせて編集</li>
-						<li>「保存」後、trackerアプリで管理者がスポーンに立ってGPS記録</li>
-					</ol>
-				</div>
-			</aside>
+	<!-- ── スポーン地点セクション ── -->
+	<section class="section">
+		<div class="section-header">
+			<div>
+				<div class="section-label">スポーン地点</div>
+				<div class="section-sub">スポーン地点に立って現在地を記録</div>
+			</div>
+			<span class="count-badge">{spawnPoints.length} 箇所</span>
 		</div>
+
+		<!-- 既存スポーン一覧 -->
+		{#if spawnPoints.length > 0}
+			<div class="spawn-list">
+				{#each spawnPoints as sp, i}
+					<div class="spawn-item">
+						<span class="spawn-num">{i + 1}</span>
+						<div class="spawn-info">
+							<span class="spawn-label-text">{sp.label}</span>
+							<span class="spawn-coord">{sp.lat.toFixed(6)}, {sp.lng.toFixed(6)}</span>
+						</div>
+						<button class="spawn-remove" onclick={() => removeSpawn(sp.id)} aria-label="削除">
+							<Trash2 size={13} />
+						</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
+
+		<!-- スポーン追加フォーム -->
+		{#if addingSpawn}
+			<div class="spawn-add-card">
+				<div class="spawn-add-gps">
+					<MapPin size={13} />
+					{#if currentPos}
+						現在地: {currentPos.coords.latitude.toFixed(6)}, {currentPos.coords.longitude.toFixed(6)}
+					{:else}
+						GPS取得中…
+					{/if}
+				</div>
+				<input
+					class="text-input"
+					type="text"
+					placeholder="スポーン名（例: チームAスポーン）"
+					bind:value={newSpawnLabel}
+					autofocus
+				/>
+				<div class="btn-row">
+					<button class="btn btn-primary" onclick={addSpawnAtCurrentPos} disabled={!currentPos}>
+						<CheckCircle size={14} />
+						この場所をスポーンに設定
+					</button>
+					<button class="btn btn-ghost" onclick={() => { addingSpawn = false; newSpawnLabel = ''; }}>
+						キャンセル
+					</button>
+				</div>
+			</div>
+		{:else}
+			<button
+				class="btn btn-secondary"
+				onclick={() => addingSpawn = true}
+				disabled={!currentPos}
+			>
+				<Plus size={15} />
+				スポーン地点を追加（今いる場所）
+			</button>
+		{/if}
+	</section>
+
+	<!-- 保存ボタン（ページ下部） -->
+	<div class="bottom-save">
+		<button class="btn btn-primary btn-large" onclick={save} disabled={saving}>
+			{saving ? '保存中…' : '💾 保存する'}
+		</button>
+	</div>
+
 	{/if}
 </div>
 
 <style>
 	:global(body) {
-		margin: 0; padding: 0;
-		background: #0a0a0a; color: #e5e5e5;
-		font-family: 'Inter', system-ui, -apple-system, sans-serif;
-		min-height: 100vh;
+		margin: 0;
+		padding: 0;
+		background: #050f05;
+		color: #4ade80;
+		font-family: 'Inter', system-ui, sans-serif;
+		font-size: 15px;
 	}
-	:global(.spawn-tooltip) {
-		background: rgba(0,0,0,0.75) !important;
-		border: 1px solid rgba(74,222,128,0.4) !important;
-		color: #4ade80 !important;
-		font-size: 11px !important;
-		font-weight: 600 !important;
-		padding: 2px 7px !important;
-		border-radius: 4px !important;
-		box-shadow: none !important;
-		white-space: nowrap !important;
+
+	.page {
+		max-width: 480px;
+		margin: 0 auto;
+		padding-bottom: 80px;
 	}
-	:global(.spawn-tooltip::before) { display: none !important; }
-	:global(.leaflet-container) { background: #111 !important; }
 
-	.page { min-height: 100vh; display: flex; flex-direction: column; }
+	/* ── ヘッダー ── */
+	.header {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 14px 16px 10px;
+		border-bottom: 1px solid rgba(74,222,128,0.1);
+		position: sticky;
+		top: 0;
+		background: rgba(5,15,5,0.98);
+		z-index: 100;
+		backdrop-filter: blur(10px);
+	}
+	.back-link {
+		display: flex;
+		align-items: center;
+		color: rgba(74,222,128,0.5);
+		text-decoration: none;
+		padding: 4px;
+	}
+	.back-link:hover { color: #4ade80; }
+	.title {
+		flex: 1;
+		font-size: 1rem;
+		font-weight: 800;
+		color: #4ade80;
+		margin: 0;
+		text-shadow: 0 0 12px rgba(74,222,128,0.3);
+		font-family: monospace;
+		letter-spacing: 0.04em;
+	}
+	.save-btn {
+		background: #4ade80;
+		color: #020c02;
+		border: none;
+		border-radius: 8px;
+		padding: 6px 16px;
+		font-size: 0.82rem;
+		font-weight: 800;
+		cursor: pointer;
+		box-shadow: 0 0 10px rgba(74,222,128,0.35);
+	}
+	.save-btn:hover:not(:disabled) { box-shadow: 0 0 18px rgba(74,222,128,0.55); }
+	.save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-	header {
-		border-bottom: 1px solid rgba(255,255,255,0.07);
-		background: rgba(15,15,15,0.97);
-		position: sticky; top: 0; z-index: 100;
+	.loading {
+		text-align: center;
+		padding: 40px;
+		color: rgba(74,222,128,0.4);
+		font-family: monospace;
+	}
+
+	/* ── GPS状態バー ── */
+	.gps-bar {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		padding: 9px 16px;
+		font-size: 0.7rem;
+		font-family: monospace;
+		border-bottom: 1px solid rgba(74,222,128,0.08);
+	}
+	.gps-ok { color: #4ade80; background: rgba(74,222,128,0.05); }
+	.gps-wait { color: rgba(74,222,128,0.35); }
+
+	/* ── ステータス ── */
+	.status-msg {
+		margin: 10px 16px 0;
+		padding: 9px 14px;
+		background: rgba(74,222,128,0.07);
+		border: 1px solid rgba(74,222,128,0.2);
+		border-radius: 8px;
+		font-size: 0.76rem;
+		color: rgba(74,222,128,0.85);
+	}
+	.save-msg {
+		margin: 10px 16px 0;
+		padding: 9px 14px;
+		background: rgba(74,222,128,0.1);
+		border: 1px solid rgba(74,222,128,0.3);
+		border-radius: 8px;
+		font-size: 0.8rem;
+		color: #4ade80;
+		font-weight: 600;
+		text-align: center;
+	}
+
+	/* ── セクション ── */
+	.section {
+		margin: 14px 16px 0;
+		background: rgba(74,222,128,0.03);
+		border: 1px solid rgba(74,222,128,0.1);
+		border-radius: 14px;
+		padding: 14px;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.section-header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 8px;
+	}
+	.section-label {
+		font-size: 0.82rem;
+		font-weight: 800;
+		color: #4ade80;
+		letter-spacing: 0.04em;
+		display: block;
+	}
+	.section-sub {
+		font-size: 0.66rem;
+		color: rgba(74,222,128,0.4);
+		margin-top: 2px;
+	}
+	.count-badge {
+		background: rgba(74,222,128,0.1);
+		border: 1px solid rgba(74,222,128,0.25);
+		border-radius: 20px;
+		padding: 2px 10px;
+		font-size: 0.7rem;
+		font-weight: 700;
+		color: #4ade80;
+		white-space: nowrap;
+		font-family: monospace;
 		flex-shrink: 0;
 	}
-	.header-inner {
-		max-width: 100%; padding: 12px 20px;
-		display: flex; align-items: center; justify-content: space-between; gap: 16px;
-	}
-	h1 { margin: 0; font-size: 0.95rem; font-weight: 600; }
 
-	.back-btn {
-		display: flex; align-items: center; gap: 6px;
-		background: transparent; border: none;
-		color: rgba(255,255,255,0.4); font-size: 0.85rem; cursor: pointer;
-		padding: 6px 10px; border-radius: 8px; transition: color 0.15s;
-	}
-	.back-btn:hover { color: #fff; }
-
-	.save-btn {
-		display: flex; align-items: center; gap: 6px;
-		background: #4ade80; color: #000; border: none;
-		padding: 8px 18px; border-radius: 8px;
-		font-size: 0.85rem; font-weight: 700; cursor: pointer; transition: opacity 0.15s;
-	}
-	.save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-	.save-btn:not(:disabled):hover { opacity: 0.85; }
-
-	.center-msg {
-		flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-		color: rgba(255,255,255,0.35); font-size: 0.9rem; gap: 12px;
-	}
-	.center-msg.error { color: #f87171; }
-	.link { color: #4ade80; text-decoration: none; font-size: 0.85rem; }
-
-	.layout {
-		flex: 1; display: grid; grid-template-columns: 1fr 300px;
-		min-height: 0; height: calc(100vh - 57px);
-	}
-	@media (max-width: 700px) {
-		.layout { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height: auto; }
-	}
-
-	.map-wrap { position: relative; }
-	.map { width: 100%; height: 100%; }
-
-	.map-hint {
-		position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
-		background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
-		border: 1px solid rgba(255,255,255,0.1);
-		border-radius: 20px; padding: 7px 16px;
-		font-size: 0.78rem; color: rgba(255,255,255,0.5);
-		z-index: 10; white-space: nowrap;
-		display: flex; align-items: center; gap: 10px;
-		transition: border-color 0.2s;
-	}
-	.map-hint.add-active {
-		border-color: rgba(74,222,128,0.5); color: #4ade80;
-	}
-	.hint-cancel {
-		background: rgba(74,222,128,0.15); border: 1px solid rgba(74,222,128,0.4);
-		border-radius: 12px; color: #4ade80; font-size: 0.75rem; font-weight: 600;
-		padding: 3px 10px; cursor: pointer; transition: background 0.15s;
-	}
-	.hint-cancel:hover { background: rgba(74,222,128,0.25); }
-
-	aside.panel {
-		background: rgba(255,255,255,0.02);
-		border-left: 1px solid rgba(255,255,255,0.07);
-		overflow-y: auto; padding: 20px 16px;
-		display: flex; flex-direction: column; gap: 14px;
-	}
-
-	.panel-header {
-		display: flex; align-items: center; justify-content: space-between;
-	}
-	.panel-header h2 {
-		margin: 0; font-size: 0.88rem; font-weight: 600;
-		display: flex; align-items: center; gap: 6px; color: #e5e5e5;
-	}
-	.spawn-count {
-		font-size: 0.75rem; font-weight: 600;
-		background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.25);
-		color: #4ade80; border-radius: 20px; padding: 2px 8px;
-	}
-
-	.add-btn {
-		display: flex; align-items: center; justify-content: center; gap: 6px;
-		width: 100%; padding: 10px;
-		background: rgba(74,222,128,0.06); border: 1px solid rgba(74,222,128,0.25);
-		border-radius: 10px; color: #4ade80; font-size: 0.82rem; font-weight: 600;
-		cursor: pointer; transition: all 0.15s;
-	}
-	.add-btn:hover, .add-btn.active {
-		background: rgba(74,222,128,0.14); border-color: rgba(74,222,128,0.5);
-	}
-
-	.empty-hint {
-		font-size: 0.78rem; color: rgba(255,255,255,0.25); text-align: center;
-		line-height: 1.6; margin: 0; padding: 12px 0;
-	}
-
-	.spawn-list {
-		list-style: none; margin: 0; padding: 0;
-		display: flex; flex-direction: column; gap: 8px;
-	}
-	.spawn-item {
-		display: flex; align-items: center; gap: 8px;
-		background: rgba(255,255,255,0.03);
-		border: 1px solid rgba(255,255,255,0.07);
-		border-radius: 10px; padding: 10px 10px 10px 12px;
-	}
-	.spawn-num {
-		width: 22px; height: 22px; border-radius: 50%;
-		background: #4ade80; color: #000;
-		font-size: 11px; font-weight: 700;
-		display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-	}
-	.spawn-body {
-		flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0;
-	}
-	.spawn-label-input {
-		background: transparent; border: none; outline: none;
-		color: #e5e5e5; font-size: 0.83rem; font-weight: 500;
-		border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;
+	/* ── 入力フィールド ── */
+	.text-input {
 		width: 100%;
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.2);
+		border-radius: 9px;
+		color: #4ade80;
+		font-size: 0.88rem;
+		padding: 10px 12px;
+		outline: none;
+		box-sizing: border-box;
+		transition: border-color 0.15s;
 	}
-	.spawn-label-input:focus { border-bottom-color: rgba(74,222,128,0.5); }
-	.spawn-coords {
-		font-size: 0.68rem; color: rgba(255,255,255,0.25);
-		font-family: 'SF Mono', 'Fira Code', monospace;
-	}
-	.del-btn {
-		background: transparent; border: none; color: rgba(255,255,255,0.2);
-		cursor: pointer; padding: 4px; display: flex; align-items: center;
-		border-radius: 6px; transition: all 0.15s; flex-shrink: 0;
-	}
-	.del-btn:hover { color: #ef4444; background: rgba(239,68,68,0.1); }
+	.text-input::placeholder { color: rgba(74,222,128,0.25); }
+	.text-input:focus { border-color: rgba(74,222,128,0.5); background: rgba(74,222,128,0.07); }
 
-	.warn { font-size: 0.75rem; color: #facc15; margin: 0; }
-	.ok { font-size: 0.75rem; color: #4ade80; margin: 0; line-height: 1.5; }
-
-	.field-width-row { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }
-	.field-width-label { font-size: 0.75rem; font-weight: 700; color: #9ca3af; }
-
-	.measure-btn {
-		width: 100%; padding: 10px;
-		background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.3);
-		border-radius: 10px; color: #60a5fa; font-size: 0.82rem; font-weight: 600;
-		cursor: pointer; transition: all 0.15s;
+	/* ── ボタン ── */
+	.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+	.btn {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 10px 16px;
+		border-radius: 10px;
+		font-size: 0.82rem;
+		font-weight: 700;
+		cursor: pointer;
+		border: none;
+		transition: all 0.15s;
+		white-space: nowrap;
 	}
-	.measure-btn:hover { background: rgba(96,165,250,0.16); }
-
-	.measuring-state {
-		display: flex; flex-direction: column; gap: 6px;
-		background: rgba(96,165,250,0.05); border: 1px solid rgba(96,165,250,0.25);
-		border-radius: 10px; padding: 10px;
+	.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+	.btn-primary {
+		background: #4ade80;
+		color: #020c02;
+		box-shadow: 0 0 12px rgba(74,222,128,0.3);
 	}
-	.measure-pulse {
-		font-size: 0.8rem; color: #60a5fa; font-weight: 600;
+	.btn-primary:hover:not(:disabled) { box-shadow: 0 0 20px rgba(74,222,128,0.5); background: #22c55e; }
+	.btn-secondary {
+		background: rgba(74,222,128,0.1);
+		color: #4ade80;
+		border: 1px solid rgba(74,222,128,0.3);
+		width: 100%;
+		justify-content: center;
+	}
+	.btn-secondary:hover:not(:disabled) { background: rgba(74,222,128,0.18); }
+	.btn-ghost {
+		background: transparent;
+		color: rgba(74,222,128,0.4);
+		border: 1px solid rgba(74,222,128,0.15);
+	}
+	.btn-ghost:hover { color: #4ade80; background: rgba(74,222,128,0.05); }
+	.btn-danger-outline {
+		background: transparent;
+		color: rgba(255,80,80,0.7);
+		border: 1px solid rgba(255,80,80,0.25);
+	}
+	.btn-danger-outline:hover { background: rgba(255,80,80,0.08); }
+	.btn-stop {
+		background: rgba(255,80,80,0.15);
+		color: #f87171;
+		border: 1px solid rgba(255,80,80,0.3);
+		width: 100%;
+		justify-content: center;
+		font-size: 0.85rem;
+	}
+	.btn-stop:hover { background: rgba(255,80,80,0.25); }
+	.btn-large { width: 100%; justify-content: center; font-size: 0.95rem; padding: 13px; }
+
+	/* ── 外周記録UI ── */
+	.recording-card {
+		background: rgba(74,222,128,0.06);
+		border: 1px solid rgba(74,222,128,0.25);
+		border-radius: 12px;
+		padding: 16px;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 10px;
+		animation: border-glow 2s ease-in-out infinite;
+	}
+	@keyframes border-glow {
+		0%,100% { border-color: rgba(74,222,128,0.25); box-shadow: none; }
+		50%      { border-color: rgba(74,222,128,0.5);  box-shadow: 0 0 12px rgba(74,222,128,0.12); }
+	}
+	.recording-pulse {
+		width: 14px; height: 14px;
+		border-radius: 50%;
+		background: #4ade80;
+		box-shadow: 0 0 8px #4ade80;
 		animation: pulse 1.2s ease-in-out infinite;
 	}
-	@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-	.measure-stop-btn {
-		background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.4);
-		border-radius: 8px; color: #4ade80; font-size: 0.82rem; font-weight: 700;
-		padding: 7px; cursor: pointer; transition: all 0.15s;
+	@keyframes pulse {
+		0%,100% { transform: scale(1); opacity: 1; }
+		50% { transform: scale(1.35); opacity: 0.7; }
 	}
-	.measure-stop-btn:hover { background: rgba(74,222,128,0.2); }
-
-	.measure-result { font-size: 0.78rem; color: #4ade80; margin: 0; }
-	.measure-result strong { font-size: 0.9rem; }
-
-	.field-width-input-wrap { display: flex; align-items: center; gap: 6px; }
-	.field-width-input {
-		width: 80px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
-		border-radius: 8px; color: #e5e5e5; font-size: 0.9rem; padding: 6px 10px; text-align: center;
+	.recording-info { display: flex; align-items: center; gap: 10px; }
+	.recording-label {
+		font-size: 0.7rem;
+		font-weight: 700;
+		color: rgba(74,222,128,0.5);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		font-family: monospace;
 	}
-	.field-width-unit { font-size: 0.78rem; color: #6b7280; }
-	.field-width-hint { font-size: 0.7rem; color: #4b5563; margin: 0; }
-
-	.how-to {
-		margin-top: auto; padding-top: 14px;
-		border-top: 1px solid rgba(255,255,255,0.06);
-		font-size: 0.72rem; color: rgba(255,255,255,0.25); line-height: 1.7;
+	.recording-count {
+		font-size: 1.4rem;
+		font-weight: 800;
+		color: #4ade80;
+		font-family: monospace;
+		text-shadow: 0 0 12px rgba(74,222,128,0.5);
 	}
-	.how-to-title { font-weight: 600; color: rgba(255,255,255,0.35); margin: 0 0 6px; }
-	.how-to ol { margin: 0; padding-left: 16px; }
-	.how-to li { margin-bottom: 4px; }
+	.recording-hint {
+		font-size: 0.7rem;
+		color: rgba(74,222,128,0.45);
+		text-align: center;
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.boundary-ok {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 0.75rem;
+		color: #4ade80;
+		font-weight: 600;
+	}
+	.boundary-warn { font-size: 0.72rem; color: #fbbf24; font-weight: 600; }
+
+	.point-list {
+		background: rgba(0,0,0,0.2);
+		border-radius: 8px;
+		padding: 8px 10px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.point-list-title {
+		font-size: 0.63rem;
+		font-weight: 700;
+		color: rgba(74,222,128,0.35);
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		margin-bottom: 4px;
+		font-family: monospace;
+	}
+	.point-item {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 0.65rem;
+		font-family: monospace;
+	}
+	.point-num { color: rgba(74,222,128,0.3); min-width: 30px; font-size: 0.6rem; }
+	.point-coord { color: rgba(74,222,128,0.6); }
+	.point-more { font-size: 0.6rem; color: rgba(74,222,128,0.25); font-family: monospace; padding-left: 4px; }
+
+	/* ── スポーン一覧 ── */
+	.spawn-list { display: flex; flex-direction: column; gap: 6px; }
+	.spawn-item {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		background: rgba(74,222,128,0.04);
+		border: 1px solid rgba(74,222,128,0.12);
+		border-radius: 9px;
+		padding: 9px 12px;
+	}
+	.spawn-num {
+		width: 24px; height: 24px;
+		border-radius: 50%;
+		background: rgba(5,15,5,0.9);
+		border: 1.5px solid rgba(74,222,128,0.4);
+		color: #4ade80;
+		font-size: 0.72rem;
+		font-weight: 800;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		font-family: monospace;
+		box-shadow: 0 0 6px rgba(74,222,128,0.2);
+	}
+	.spawn-info { flex: 1; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+	.spawn-label-text { font-size: 0.82rem; font-weight: 700; color: #4ade80; }
+	.spawn-coord {
+		font-size: 0.62rem;
+		color: rgba(74,222,128,0.4);
+		font-family: monospace;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.spawn-remove {
+		background: transparent;
+		border: none;
+		color: rgba(255,80,80,0.4);
+		cursor: pointer;
+		padding: 4px;
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+	}
+	.spawn-remove:hover { color: #f87171; }
+
+	.spawn-add-card {
+		background: rgba(74,222,128,0.05);
+		border: 1px solid rgba(74,222,128,0.2);
+		border-radius: 11px;
+		padding: 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 9px;
+	}
+	.spawn-add-gps {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 0.68rem;
+		color: rgba(74,222,128,0.55);
+		font-family: monospace;
+	}
+
+	.bottom-save { margin: 20px 16px 0; }
 </style>
